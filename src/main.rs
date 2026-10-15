@@ -25,16 +25,18 @@ row.drop-before { box-shadow: inset 0 2px @accent_color; }
 row.drop-after { box-shadow: inset 0 -2px @accent_color; }
 row.drop-into { background-color: alpha(@accent_color, 0.2); }
 
-/* Connections: each host a separate, roomy card. */
-.connections > row.host {
-    padding: 9px 10px;
-    margin-top: 3px;
-    margin-bottom: 3px;
-    border: 1px solid alpha(currentColor, 0.1);
-}
-.connections > row.host:not(:hover):not(:selected) { background-color: alpha(currentColor, 0.03); }
-.connections > row.group { padding: 8px 10px; margin-top: 10px; }
-.connections .host-title { font-weight: bold; }
+.terminal-card { background-color: #000000; border-radius: 12px; }
+
+/* File manager cards, as in sshPilot. */
+.pane-bar { padding: 6px; }
+.file-header { padding: 10px 18px 4px 46px; }
+.file-list { background-color: transparent; }
+.terminal-card vte-terminal { padding: 6px 8px; }
+
+/* Connections, spaced like sshPilot: roomy one-line rows, rounded selection. */
+.connections > row { border-radius: 8px; }
+.connections > row.host { padding: 8px 10px; margin-top: 2px; margin-bottom: 2px; }
+.connections > row.group { padding: 8px 10px; margin-top: 4px; }
 ";
 
 /// One background runtime for SSH/SFTP I/O; the UI stays on the GTK thread.
@@ -214,7 +216,7 @@ fn tab_menu(app: &Rc<App>) {
             let Some((page, host)) = target(&app) else {
                 return;
             };
-            if !page.child().is::<vte4::Terminal>() {
+            if terminal::terminal_in(&page).is_none() {
                 files::open(&app, &host);
             } else if host.is_empty() {
                 terminal::open_local(&app);
@@ -311,7 +313,7 @@ fn build(application: &adw::Application) {
         .menu_model(&add_menu)
         .build();
     let sidebar_header = adw::HeaderBar::new();
-    sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Connections", "")));
+    sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("SSH Pilot RS", "")));
     sidebar_header.pack_start(&add_button);
     let hide_sidebar = gtk::Button::builder()
         .icon_name("pan-start-symbolic")
@@ -346,8 +348,8 @@ fn build(application: &adw::Application) {
     // Terminal text size: [-] [100%] [+]
     let zoom_label = gtk::Label::new(None);
     zoom_label.set_width_chars(5);
+    zoom_label.add_css_class("caption");
     let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    zoom_box.add_css_class("linked");
     for (icon, tooltip, action) in [
         ("zoom-out-symbolic", "Smaller Text (Ctrl+−)", "win.zoom-out"),
         ("", "Default Text Size (Ctrl+0)", "win.zoom-reset"),
@@ -356,6 +358,7 @@ fn build(application: &adw::Application) {
         let button = gtk::Button::builder()
             .tooltip_text(tooltip)
             .action_name(action)
+            .css_classes(["flat"])
             .build();
         if icon.is_empty() {
             button.set_child(Some(&zoom_label));
@@ -364,18 +367,37 @@ fn build(application: &adw::Application) {
         }
         zoom_box.append(&button);
     }
-    let content_header = adw::HeaderBar::new();
-    content_header.pack_end(&zoom_box);
     // Brings the connections panel back; only shown while it is hidden.
     let show_sidebar = gtk::Button::builder()
         .icon_name("pan-end-symbolic")
         .tooltip_text("Show Connections (F9)")
         .action_name("win.toggle-sidebar")
+        .css_classes(["flat"])
         .build();
-    content_header.pack_start(&show_sidebar);
+    // Its popover needs the app, so it is set once that exists.
+    let font_button = gtk::MenuButton::builder()
+        .icon_name("preferences-desktop-font-symbolic")
+        .tooltip_text("Terminal Font")
+        .css_classes(["flat"])
+        .build();
+    // The title row, laid out like sshPilot's: tabs fill it from the left at
+    // their natural width, between the window buttons.
+    tab_bar.set_hexpand(true);
+    tab_bar.set_expand_tabs(false);
+    tab_bar.add_css_class("inline");
+    let start_controls = gtk::WindowControls::new(gtk::PackType::Start);
+    let header_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header_row.add_css_class("toolbar");
+    header_row.set_size_request(-1, 46);
+    header_row.append(&start_controls);
+    header_row.append(&show_sidebar);
+    header_row.append(&tab_bar);
+    header_row.append(&font_button);
+    header_row.append(&zoom_box);
+    header_row.append(&gtk::WindowControls::new(gtk::PackType::End));
+    let content_header = gtk::WindowHandle::builder().child(&header_row).build();
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
-    content_view.add_top_bar(&tab_bar);
     content_view.set_content(Some(&stack));
     tabs.connect_n_pages_notify(glib::clone!(
         #[weak]
@@ -399,10 +421,17 @@ fn build(application: &adw::Application) {
     let sidebar_hidden = layout.sidebar_hidden;
     split.set_show_sidebar(!sidebar_hidden);
     show_sidebar.set_visible(sidebar_hidden);
+    start_controls.set_visible(sidebar_hidden);
+    // With the panel shown, its own header has the start-side window buttons.
     split.connect_show_sidebar_notify(glib::clone!(
         #[weak]
         show_sidebar,
-        move |split| show_sidebar.set_visible(!split.shows_sidebar())
+        #[weak]
+        start_controls,
+        move |split| {
+            show_sidebar.set_visible(!split.shows_sidebar());
+            start_controls.set_visible(!split.shows_sidebar());
+        }
     ));
 
     let toasts = adw::ToastOverlay::new();
@@ -465,6 +494,7 @@ fn build(application: &adw::Application) {
         }
     ));
     window.add_action(&toggle_sidebar);
+    font_button.set_popover(Some(&terminal::font_popover(&app)));
     application.set_accels_for_action("win.toggle-sidebar", &["F9"]);
     for (name, larger) in [
         ("zoom-in", Some(true)),
@@ -540,7 +570,10 @@ fn main() -> glib::ExitCode {
     }
     let application = adw::Application::builder().application_id(APP_ID).build();
     // The installed icon (see scripts/install.sh), for X11 window lists.
-    application.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
+    application.connect_startup(|_| {
+        desktop::provide_icon();
+        gtk::Window::set_default_icon_name(APP_ID);
+    });
     application.connect_activate(build);
     application.run()
 }

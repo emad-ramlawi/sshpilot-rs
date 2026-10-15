@@ -13,6 +13,9 @@ use crate::{APP_ID, store};
 
 const DESKTOP_ENTRY: &str = include_str!("../data/io.github.emad_ramlawi.SshPilotRs.desktop");
 const ICON: &str = include_str!("../data/icons/io.github.emad_ramlawi.SshPilotRs.svg");
+/// The connection icon in the sidebar (the same in every icon theme).
+pub const SERVER_ICON: &str = "io.github.emad_ramlawi.SshPilotRs-server";
+const SERVER_SVG: &str = include_str!("../data/icons/io.github.emad_ramlawi.SshPilotRs-server.svg");
 
 /// `$XDG_DATA_HOME`, normally ~/.local/share.
 fn data_dir() -> PathBuf {
@@ -72,6 +75,28 @@ fn entry_for(program: &str) -> Result<String> {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n")
+}
+
+/// Let the app find its own icons even before `--install` (headers, dialogs):
+/// a copy goes in a private folder under `$XDG_RUNTIME_DIR` (memory, cleared
+/// at logout) that is added to the icon theme's search path.
+pub fn provide_icon() {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+        return;
+    };
+    if !runtime.is_absolute() {
+        return;
+    }
+    let icons = runtime.join("sshpilot-rs").join("icons");
+    let apps = icons.join("hicolor/scalable/apps");
+    let written = fs::create_dir_all(&apps)
+        .and_then(|()| fs::write(apps.join(format!("{APP_ID}.svg")), ICON))
+        .and_then(|()| fs::write(apps.join(format!("{SERVER_ICON}.svg")), SERVER_SVG));
+    if written.is_ok()
+        && let Some(display) = gtk::gdk::Display::default()
+    {
+        gtk::IconTheme::for_display(&display).add_search_path(icons);
+    }
 }
 
 pub fn install() -> Result<()> {

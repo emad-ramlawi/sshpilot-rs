@@ -15,8 +15,9 @@
 
 - **Uses your `~/.ssh/config`.** Every `Host` in it (and in the files it `Include`s) shows up in the sidebar. Addresses, users, ports, keys, `ProxyJump`, agents: all of it is plain OpenSSH, so whatever works with `ssh myhost` works here. Save the file and the list updates.
 - **Groups and manual sorting.** Drag connections up and down, into and out of groups, and drag groups to reorder them. The order you set is the order you keep. The arrow at the top right of the list (or <kbd>F9</kbd>) folds the whole panel away; it stays that way next time.
-- **Terminal tabs.** Double-click a host to open a terminal running `ssh` in a tab. The app starts with a local terminal open, running your login shell (bash, zsh, fish, …, as set with `chsh`); **New Local Terminal** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd>) opens another. Right-click a tab to **Duplicate** it or **Open Files** on its host. Text size: the − / + buttons at the top, or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd>. Copy and paste with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd>.
-- **File manager.** Right-click a host and choose **Open Files**: your files on the left, the server's on the right (SFTP), with **Upload →** and **← Download** between them. Double-click a file to send it across, or drag files from your desktop onto the server side. A progress bar shows how far transfers are, with their speed. New folder, rename and delete on the server from the right-click menu. If the host needs a password, open a terminal to it first: the files tab reuses that login.
+- **Terminal tabs.** Double-click a host to open a terminal running `ssh` in a tab. The app starts with a local terminal open, running your login shell (bash, zsh, fish, …, as set with `chsh`); **New Local Terminal** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd>) opens another. Right-click a tab to **Duplicate** it or **Open Files** on its host. Copy and paste with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd>.
+- **The look you know from sshPilot.** White on black with the Tango palette (as in GNOME Terminal), tabs in the title bar, color file icons. Pick the terminal font and size with the **Aa** button at the top (monospace fonts only, applied as you choose); until you do, it uses the font set in sshPilot if you have it, else `Monospace 12`. Zoom with the − / + buttons, or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd>.
+- **File manager.** Right-click a host and choose **Open Files**: your files on the left, the server's on the right (SFTP), listed by name, size and date. Select files and press **Upload** (under yours) or **Download** (under the server's), double-click a file to send it across, or drag files from your desktop onto the server side. The eye button shows hidden files. A progress bar shows how far transfers are, with their speed. New folder, rename and delete on the server from the right-click menu. If the host needs a password, open a terminal to it first: the files tab reuses that login.
 - **Fast, and fine to leave open all day.** Tabs to the same host share one SSH login, so a second terminal or the file manager opens instantly. Keep-alives hold idle connections through NAT and firewall timeouts, and the file manager reconnects by itself if a connection drops. Transfers keep many requests in flight, so they run at full speed on slow links too.
 - **Few buttons.** One **+** in the sidebar (new connection, new group, local terminal); everything else lives in the right-click menu.
 
@@ -52,7 +53,7 @@ Requires GTK ≥ 4.12, libadwaita ≥ 1.5, and VTE (GTK 4 build) ≥ 0.76.
 | What | Where |
 | --- | --- |
 | Hosts | `~/.ssh/config`. **New Connection** only *appends* a `Host` block; the app never rewrites or reorders your file. |
-| Groups, order, text size, panel folded | `~/.config/sshpilot-rs/layout.json` (aliases only, mode `0600`) |
+| Groups, order, terminal font and size, panel folded | `~/.config/sshpilot-rs/layout.json` (aliases only, mode `0600`) |
 | Passwords | Nowhere. OpenSSH asks for them in the terminal. |
 
 ## Why a Rust rewrite

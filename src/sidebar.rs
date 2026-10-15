@@ -92,7 +92,7 @@ pub fn rebuild(app: &Rc<App>) {
             }
         }
     }
-    if !layout.groups.is_empty() {
+    if !layout.groups.is_empty() && !layout.ungrouped.is_empty() {
         // Also the drop target for taking a connection out of its group.
         let label = gtk::Label::builder()
             .label("Ungrouped")
@@ -120,6 +120,7 @@ pub fn rebuild(app: &Rc<App>) {
 }
 
 fn group_row(id: Id, name: &str, count: usize, collapsed: bool) -> gtk::ListBoxRow {
+    // Name in bold, the fold arrow on the right, as in sshPilot.
     let arrow = gtk::Image::from_icon_name(if collapsed {
         "pan-end-symbolic"
     } else {
@@ -134,10 +135,11 @@ fn group_row(id: Id, name: &str, count: usize, collapsed: bool) -> gtk::ListBoxR
     label.add_css_class("heading");
     let count = gtk::Label::new(Some(&count.to_string()));
     count.add_css_class("dim-label");
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    content.append(&arrow);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    content.append(&list_icon(&["inode-directory", "folder"]));
     content.append(&label);
     content.append(&count);
+    content.append(&arrow);
     let row = gtk::ListBoxRow::builder()
         .child(&content)
         .selectable(false)
@@ -148,37 +150,41 @@ fn group_row(id: Id, name: &str, count: usize, collapsed: bool) -> gtk::ListBoxR
 }
 
 fn host_row(app: &Rc<App>, alias: &str, nested: bool) -> gtk::ListBoxRow {
+    // One line with the alias, as in sshPilot; where it goes is in the tooltip.
     let target = app.host(alias).map(|h| h.target()).unwrap_or_default();
     let title = gtk::Label::builder()
         .label(alias)
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let subtitle = gtk::Label::builder()
-        .label(&target)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .build();
-    title.add_css_class("host-title");
-    subtitle.add_css_class("caption");
-    subtitle.add_css_class("dim-label");
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
-    text.append(&title);
-    text.append(&subtitle);
-    let icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
-    icon.set_pixel_size(20);
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    content.append(&icon);
-    content.append(&text);
+    content.append(&list_icon(&[crate::desktop::SERVER_ICON, "network-server"]));
+    content.append(&title);
     let row = gtk::ListBoxRow::builder()
         .child(&content)
         .css_classes(["host"])
+        .tooltip_text(&target)
         .build();
     if nested {
         row.set_margin_start(16);
     }
     add_drag_source(&row, Dragged::Host(alias.to_owned()));
     row
+}
+
+/// A full-color icon: the first of `names` the icon theme has, at the file
+/// manager's size. Names are tried one by one, because a combined lookup
+/// prefers any fallback the current theme has over our own icon (which lives
+/// in hicolor); and 24 px, because some themes (Breeze) draw 22 px and
+/// smaller as monochrome line art.
+fn list_icon(names: &[&str]) -> gtk::Image {
+    let name = gdk::Display::default()
+        .map(|display| gtk::IconTheme::for_display(&display))
+        .and_then(|theme| names.iter().find(|name| theme.has_icon(name)))
+        .unwrap_or(&names[0]);
+    let image = gtk::Image::from_icon_name(name);
+    image.set_pixel_size(24);
+    image
 }
 
 fn add_drag_source(row: &gtk::ListBoxRow, dragged: Dragged) {

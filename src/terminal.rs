@@ -5,7 +5,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib, pango};
 use vte4::prelude::*;
 
 use crate::{App, ssh, store};
@@ -37,7 +37,7 @@ pub fn open_local(app: &Rc<App>) {
     );
     // Show the title the shell sets (fish does by default; bash and zsh
     // through their prompt settings), like other terminals do.
-    if let Ok(terminal) = page.child().downcast::<vte4::Terminal>() {
+    if let Some(terminal) = terminal_in(&page) {
         terminal.connect_window_title_changed(glib::clone!(
             #[weak]
             page,
@@ -112,6 +112,7 @@ fn add_tab(
     terminal.set_hexpand(true);
     terminal.set_scrollback_lines(10_000);
     terminal.set_font_scale(font_scale(app));
+    apply_look(app, &terminal);
     add_shortcuts(&terminal);
 
     let program = argv[0].clone();
@@ -139,7 +140,19 @@ fn add_tab(
         terminal.feed(b"\r\n[Session ended]\r\n");
     });
 
-    let page = app.tabs.append(&terminal);
+    // A rounded black card with a scrollbar, as in sshPilot.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&terminal)
+        .build();
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("terminal-card");
+    card.set_overflow(gtk::Overflow::Hidden);
+    card.set_margin_start(6);
+    card.set_margin_end(6);
+    card.set_margin_bottom(6);
+    card.append(&scroller);
+    let page = app.tabs.append(&card);
     page.set_title(title);
     // Which host the tab is for (the tab menu duplicates it).
     page.set_keyword(host);
@@ -147,6 +160,168 @@ fn add_tab(
     app.tabs.set_selected_page(&page);
     terminal.grab_focus();
     page
+}
+
+/// The terminal shown in `page`, if it is a terminal tab.
+pub fn terminal_in(page: &adw::TabPage) -> Option<vte4::Terminal> {
+    page.child()
+        .first_child()?
+        .downcast::<gtk::ScrolledWindow>()
+        .ok()?
+        .child()?
+        .downcast()
+        .ok()
+}
+
+/// White on black with the Tango palette, as in GNOME Terminal (and the
+/// default theme of sshPilot, which this app grew out of).
+const FOREGROUND: &str = "#FFFFFF";
+const BACKGROUND: &str = "#000000";
+const PALETTE: [&str; 16] = [
+    "#000000", "#CC0000", "#4E9A06", "#C4A000", "#3465A4", "#75507B", "#06989A", "#D3D7CF",
+    "#555753", "#EF2929", "#8AE234", "#FCE94F", "#729FCF", "#AD7FA8", "#34E2E2", "#EEEEEC",
+];
+
+fn rgba(hex: &str) -> gdk::RGBA {
+    gdk::RGBA::parse(hex).expect("valid color")
+}
+
+/// Colors and font. Selection colors stay unset, so VTE shows a selection
+/// in reverse video and colored output stays readable while selected.
+fn apply_look(app: &App, terminal: &vte4::Terminal) {
+    let palette: Vec<gdk::RGBA> = PALETTE.iter().map(|hex| rgba(hex)).collect();
+    let palette: Vec<&gdk::RGBA> = palette.iter().collect();
+    let foreground = rgba(FOREGROUND);
+    terminal.set_colors(Some(&foreground), Some(&rgba(BACKGROUND)), &palette);
+    terminal.set_color_cursor(Some(&foreground));
+    terminal.set_font(Some(&pango::FontDescription::from_string(&font(app))));
+}
+
+/// The chosen terminal font; until one is chosen, the one set in sshPilot
+/// (read-only, for people coming from it), else "Monospace 12".
+pub fn font(app: &App) -> String {
+    if let Some(font) = &app.layout.borrow().terminal_font {
+        return font.clone();
+    }
+    static DEFAULT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DEFAULT
+        .get_or_init(|| sshpilot_font().unwrap_or_else(|| "Monospace 12".to_owned()))
+        .clone()
+}
+
+fn sshpilot_font() -> Option<String> {
+    let path = store::home_dir().join(".config/sshpilot/config.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let font = config.get("terminal")?.get("font")?.as_str()?.trim();
+    (!font.is_empty() && !font.chars().any(char::is_control)).then(|| font.to_owned())
+}
+
+/// The terminal font picker: a monospace family and a size, applied to every
+/// tab as they are picked.
+pub fn font_popover(app: &Rc<App>) -> gtk::Popover {
+    let current = pango::FontDescription::from_string(&font(app));
+    let current_family = current
+        .family()
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "Monospace".to_owned());
+    let current_size = match current.size() {
+        0 => 12.0,
+        size => f64::from(size) / f64::from(pango::SCALE),
+    };
+    let mut families: Vec<String> = app
+        .window
+        .pango_context()
+        .list_families()
+        .iter()
+        .filter(|family| family.is_monospace())
+        .map(|family| family.name().to_string())
+        .collect();
+    if !families.contains(&current_family) {
+        families.push(current_family.clone());
+    }
+    families.sort_by_key(|family| family.to_lowercase());
+    families.dedup();
+
+    let names: Vec<&str> = families.iter().map(String::as_str).collect();
+    let family = gtk::DropDown::from_strings(&names);
+    // Type to search the list.
+    family.set_enable_search(true);
+    family.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    )));
+    if let Some(index) = families.iter().position(|f| *f == current_family) {
+        family.set_selected(index as u32);
+    }
+    let size = gtk::SpinButton::with_range(6.0, 48.0, 1.0);
+    size.set_value(current_size.round());
+
+    let size_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    size_row.append(
+        &gtk::Label::builder()
+            .label("Size")
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    size_row.append(&size);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+    content.append(
+        &gtk::Label::builder()
+            .label("Terminal Font")
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build(),
+    );
+    content.append(&family);
+    content.append(&size_row);
+
+    let apply = Rc::new(glib::clone!(
+        #[weak]
+        app,
+        #[weak]
+        family,
+        #[weak]
+        size,
+        move || {
+            let Some(name) = family
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|s| s.string())
+            else {
+                return;
+            };
+            set_font(&app, &format!("{name} {}", size.value_as_int()));
+        }
+    ));
+    family.connect_selected_notify(glib::clone!(
+        #[strong]
+        apply,
+        move |_| apply()
+    ));
+    size.connect_value_changed(move |_| apply());
+
+    gtk::Popover::builder().child(&content).build()
+}
+
+/// Use `font` ("Hack 12") in every terminal, now and next time.
+pub fn set_font(app: &App, font: &str) {
+    app.layout.borrow_mut().terminal_font = Some(font.to_owned());
+    if let Err(e) = app.layout.borrow().save(&app.path) {
+        app.toast(&e.to_string());
+    }
+    let description = pango::FontDescription::from_string(font);
+    for i in 0..app.tabs.n_pages() {
+        if let Some(terminal) = terminal_in(&app.tabs.nth_page(i)) {
+            terminal.set_font(Some(&description));
+        }
+    }
 }
 
 /// Text sizes the zoom buttons step through.
@@ -173,7 +348,7 @@ pub fn zoom(app: &Rc<App>, larger: Option<bool>) {
         app.toast(&e.to_string());
     }
     for i in 0..app.tabs.n_pages() {
-        if let Ok(terminal) = app.tabs.nth_page(i).child().downcast::<vte4::Terminal>() {
+        if let Some(terminal) = terminal_in(&app.tabs.nth_page(i)) {
             terminal.set_font_scale(scale);
         }
     }

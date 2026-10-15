@@ -31,19 +31,26 @@ struct Entry {
     dir: bool,
     link: bool,
     size: u64,
+    /// Last change, in seconds since 1970.
+    modified: Option<i64>,
 }
 
-/// One side of the file manager: a folder listing under a path bar.
+/// One side of the file manager, laid out as in sshPilot: a toolbar card, the
+/// listing card (Name, Size, Modified) and an action bar card at the bottom.
 struct Pane {
     root: gtk::Box,
     bar: gtk::Box,
     up: gtk::Button,
     refresh: gtk::Button,
+    hidden: gtk::ToggleButton,
     path: gtk::Entry,
     list: gtk::ListBox,
-    frame: gtk::Frame,
-    /// The folder shown, and its entries in row order.
+    card: gtk::Box,
+    actions: gtk::Box,
+    /// The folder shown; everything in it, and the entries shown (no dot
+    /// files unless asked) in row order.
     cwd: RefCell<String>,
+    all: RefCell<Vec<Entry>>,
     entries: RefCell<Vec<Entry>>,
 }
 
@@ -219,6 +226,7 @@ async fn list_dir(sftp: Arc<SftpSession>, path: String) -> Result<(String, Vec<E
                 dir: kind.is_dir(),
                 link: kind.is_symlink(),
                 size: e.metadata().len(),
+                modified: e.metadata().mtime.map(i64::from),
             }
         })
         .collect();
@@ -351,12 +359,31 @@ fn list_local(path: String) -> Result<(String, Vec<Entry>)> {
                 name,
                 dir: meta.as_ref().is_some_and(|m| m.is_dir()),
                 link,
+                modified: meta.as_ref().map(std::os::unix::fs::MetadataExt::mtime),
                 size: meta.map_or(0, |m| m.len()),
             })
         })
         .collect();
     sort_entries(&mut entries);
     Ok((dir, entries))
+}
+
+/// The file-type icon from the icon theme, in color: the type is guessed from
+/// the name alone (shared-mime-info), so listing stays fast.
+fn file_icon(entry: &Entry) -> gio::Icon {
+    if entry.dir {
+        return gio::ThemedIcon::from_names(&["inode-directory", "folder"]).upcast();
+    }
+    if entry.link {
+        return gio::ThemedIcon::from_names(&[
+            "inode-symlink",
+            "emblem-symbolic-link",
+            "text-x-generic",
+        ])
+        .upcast();
+    }
+    let (content_type, _) = gio::content_type_guess(Some(&entry.name), None);
+    gio::content_type_get_icon(&content_type)
 }
 
 fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
@@ -366,67 +393,132 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
         .build()
 }
 
-/// A button with a label and an arrow on the side it sends files to.
-fn transfer_button(label: &str, icon: &str, tooltip: &str, icon_first: bool) -> gtk::Button {
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    content.set_halign(gtk::Align::Center);
-    let image = gtk::Image::from_icon_name(icon);
-    let text = gtk::Label::new(Some(label));
-    if icon_first {
-        content.append(&image);
-        content.append(&text);
-    } else {
-        content.append(&text);
-        content.append(&image);
-    }
+/// A flat button with an icon and a label.
+fn transfer_button(label: &str, icon: &str, tooltip: &str) -> gtk::Button {
     gtk::Button::builder()
-        .child(&content)
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(icon)
+                .label(label)
+                .build(),
+        )
         .tooltip_text(tooltip)
+        .css_classes(["flat"])
         .build()
 }
 
+/// `2026-10-05 18:50`, in local time.
+fn format_time(seconds: i64) -> String {
+    glib::DateTime::from_unix_local(seconds)
+        .and_then(|time| time.format("%Y-%m-%d %H:%M"))
+        .map(String::from)
+        .unwrap_or_default()
+}
+
+fn column(text: &str, width: i32) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(text)
+        .xalign(1.0)
+        .width_chars(width)
+        .build();
+    label.add_css_class("dim-label");
+    label
+}
+
 impl Pane {
-    fn new(title: &str) -> Pane {
-        let heading = gtk::Label::builder()
-            .label(title)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
-            .build();
+    /// `title` with an optional icon: "Local", or the host.
+    fn new(title: &str, icon: Option<&str>) -> Pane {
+        let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        heading.set_margin_start(6);
+        heading.set_margin_end(4);
+        if let Some(icon) = icon {
+            heading.append(&gtk::Image::from_icon_name(icon));
+        }
+        heading.append(
+            &gtk::Label::builder()
+                .label(title)
+                .css_classes(["heading"])
+                .max_width_chars(18)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build(),
+        );
         let up = icon_button("go-up-symbolic", "Parent Folder");
         let refresh = icon_button("view-refresh-symbolic", "Refresh");
+        let hidden = gtk::ToggleButton::builder()
+            .icon_name("view-conceal-symbolic")
+            .tooltip_text("Show Hidden Files")
+            .build();
+        for button in [
+            up.upcast_ref::<gtk::Widget>(),
+            refresh.upcast_ref(),
+            hidden.upcast_ref(),
+        ] {
+            button.add_css_class("flat");
+        }
         let path = gtk::Entry::builder().hexpand(true).build();
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        bar.add_css_class("card");
+        bar.add_css_class("pane-bar");
+        bar.append(&heading);
         bar.append(&up);
         bar.append(&path);
         bar.append(&refresh);
+        bar.append(&hidden);
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        header.add_css_class("file-header");
+        let name = gtk::Label::builder()
+            .label("Name")
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        name.add_css_class("dim-label");
+        header.append(&name);
+        header.append(&column("Size", 9));
+        header.append(&column("Modified", 16));
+        let mut child = header.first_child();
+        while let Some(widget) = child {
+            widget.add_css_class("caption-heading");
+            child = widget.next_sibling();
+        }
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Multiple);
         list.set_activate_on_single_click(false);
         list.add_css_class("navigation-sidebar");
-        let frame = gtk::Frame::builder()
-            .child(
-                &gtk::ScrolledWindow::builder()
-                    .child(&list)
-                    .hscrollbar_policy(gtk::PolicyType::Never)
-                    .vexpand(true)
-                    .build(),
-            )
-            .build();
+        list.add_css_class("file-list");
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        card.add_css_class("card");
+        card.set_overflow(gtk::Overflow::Hidden);
+        card.append(&header);
+        card.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&list)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .build(),
+        );
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        actions.add_css_class("card");
+        actions.add_css_class("pane-bar");
+
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.set_hexpand(true);
-        root.append(&heading);
         root.append(&bar);
-        root.append(&frame);
+        root.append(&card);
+        root.append(&actions);
         Pane {
             root,
             bar,
             up,
             refresh,
+            hidden,
             path,
             list,
-            frame,
+            card,
+            actions,
             cwd: RefCell::default(),
+            all: RefCell::default(),
             entries: RefCell::default(),
         }
     }
@@ -434,31 +526,44 @@ impl Pane {
     fn show(&self, cwd: String, entries: Vec<Entry>) {
         self.path.set_text(&cwd);
         *self.cwd.borrow_mut() = cwd;
+        *self.all.borrow_mut() = entries;
+        self.render();
+    }
+
+    /// Fill the list from `all`, leaving out dot files unless shown.
+    fn render(&self) {
+        let show_hidden = self.hidden.is_active();
+        let entries: Vec<Entry> = self
+            .all
+            .borrow()
+            .iter()
+            .filter(|e| show_hidden || !e.name.starts_with('.'))
+            .cloned()
+            .collect();
         self.list.remove_all();
         for e in &entries {
-            let icon = if e.dir {
-                "folder-symbolic"
-            } else if e.link {
-                "insert-link-symbolic"
-            } else {
-                "text-x-generic-symbolic"
-            };
             let name = gtk::Label::builder()
                 .label(&e.name)
                 .xalign(0.0)
                 .hexpand(true)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .build();
-            let size = gtk::Label::new(Some(&if e.dir {
-                String::new()
-            } else {
-                human_size(e.size)
-            }));
-            size.add_css_class("dim-label");
+            let size = column(
+                &if e.dir {
+                    String::new()
+                } else {
+                    human_size(e.size)
+                },
+                9,
+            );
+            let modified = column(&e.modified.map(format_time).unwrap_or_default(), 16);
+            let icon = gtk::Image::from_gicon(&file_icon(e));
+            icon.set_pixel_size(24);
             let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            content.append(&gtk::Image::from_icon_name(icon));
+            content.append(&icon);
             content.append(&name);
             content.append(&size);
+            content.append(&modified);
             self.list.append(&content);
         }
         *self.entries.borrow_mut() = entries;
@@ -492,36 +597,35 @@ impl Pane {
 }
 
 pub fn open(app: &Rc<App>, alias: &str) {
-    let local = Pane::new("My Files");
-    let remote = Pane::new(&format!("Server Files — {alias}"));
+    let local = Pane::new("Local", None);
+    let remote = Pane::new(alias, Some("computer-symbolic"));
     let new_folder = icon_button("folder-new-symbolic", "New Folder");
-    remote.bar.append(&new_folder);
+    new_folder.add_css_class("flat");
+    remote
+        .bar
+        .insert_child_after(&new_folder, Some(&remote.refresh));
 
+    // Upload under your files, Download under the server's, as in sshPilot.
     let upload = transfer_button(
         "Upload",
-        "go-next-symbolic",
-        "Copy the selected files to the server",
-        false,
+        "document-send-symbolic",
+        "Copy the selected files to the server's folder",
     );
     let download = transfer_button(
         "Download",
-        "go-previous-symbolic",
-        "Copy the selected server files to My Files",
-        true,
+        "folder-download-symbolic",
+        "Copy the selected server files to your folder",
     );
-    let middle = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    middle.set_valign(gtk::Align::Center);
-    middle.append(&upload);
-    middle.append(&download);
+    local.actions.append(&upload);
+    remote.actions.append(&download);
 
     let panes = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    panes.set_homogeneous(false);
+    panes.set_homogeneous(true);
     panes.set_vexpand(true);
     panes.set_margin_top(6);
     panes.set_margin_start(6);
     panes.set_margin_end(6);
     panes.append(&local.root);
-    panes.append(&middle);
     panes.append(&remote.root);
 
     let status = gtk::Label::builder()
@@ -596,6 +700,18 @@ pub fn open(app: &Rc<App>, alias: &str) {
             None => {}
         }
     ));
+
+    for server in [false, true] {
+        let pane = if server { remote } else { local };
+        pane.hidden.connect_toggled(glib::clone!(
+            #[weak(rename_to = this)]
+            browser,
+            move |_| {
+                let pane = if server { &this.remote } else { &this.local };
+                pane.render();
+            }
+        ));
+    }
 
     // Server Files.
     remote.up.connect_clicked(glib::clone!(
@@ -674,7 +790,7 @@ pub fn open(app: &Rc<App>, alias: &str) {
             true
         }
     ));
-    remote.frame.add_controller(drop);
+    remote.card.add_controller(drop);
 
     app.connected_to(alias);
     let page = app.tabs.append(&page_box);
@@ -1252,6 +1368,29 @@ mod tests {
         assert_eq!(entries[2].path, join(&path, "alpha.txt"));
         assert!(list_local("~".to_owned()).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_icons_follow_the_type() {
+        let names = |name: &str| {
+            let entry = Entry {
+                name: name.to_owned(),
+                path: String::new(),
+                dir: false,
+                link: false,
+                size: 0,
+                modified: None,
+            };
+            let icon = file_icon(&entry);
+            let names = icon.downcast_ref::<gio::ThemedIcon>().unwrap().names();
+            names.iter().map(|n| n.to_string()).collect::<Vec<_>>()
+        };
+        assert!(names("photo.png").contains(&"image-png".to_owned()));
+        assert!(names("backup.tar.gz").iter().any(|n| n.contains("tar")
+            || n.contains("package")
+            || n.contains("zip")
+            || n.contains("archive")));
+        assert!(names("notes.txt").contains(&"text-plain".to_owned()));
     }
 
     #[test]
