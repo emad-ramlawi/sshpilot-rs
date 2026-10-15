@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 - Clicking the app icon in the top-left corner opens a new local terminal (when your desktop shows the window icon there, as KDE does by default).
 
