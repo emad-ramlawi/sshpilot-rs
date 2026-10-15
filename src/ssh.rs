@@ -1,0 +1,81 @@
+//! Command lines for the system `ssh`.
+//!
+//! Everything about a host (address, user, port, keys, jump hosts…) comes
+//! from `~/.ssh/config`: we only ever pass the alias. The terminal and the
+//! file manager share one SSH connection per host (OpenSSH multiplexing), so
+//! a password typed in the terminal also unlocks the file manager. Nothing
+//! outlives the app: each ssh process ends with the tab that started it.
+
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::PathBuf;
+
+/// Private folder for the multiplexing sockets, or `None` without a
+/// per-user runtime dir (sharing is then skipped rather than put in /tmp).
+fn control_dir() -> Option<PathBuf> {
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    if !runtime.is_absolute() {
+        return None;
+    }
+    let dir = runtime.join("sshpilot-rs");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&dir)
+        .ok()?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
+}
+
+fn base_args() -> Vec<String> {
+    let mut args = vec!["ssh".to_owned()];
+    if let Some(dir) = control_dir() {
+        args.extend([
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}/%C", dir.display()),
+            "-o".into(),
+            "ControlPersist=no".into(),
+        ]);
+    }
+    args
+}
+
+/// Interactive login shell.
+pub fn terminal_args(alias: &str) -> Vec<String> {
+    let mut args = base_args();
+    // `--` ends option parsing: the alias can never be read as an option.
+    args.extend(["--".into(), alias.to_owned()]);
+    args
+}
+
+/// The SFTP subsystem over stdin/stdout. Never prompts: it reuses the
+/// terminal's connection, or logs in with a key/agent.
+pub fn sftp_args(alias: &str) -> Vec<String> {
+    let mut args = base_args();
+    args.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=15".into(),
+        "-s".into(),
+        "--".into(),
+        alias.to_owned(),
+        "sftp".into(),
+    ]);
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_always_follows_double_dash() {
+        let t = terminal_args("web");
+        assert_eq!(&t[t.len() - 2..], ["--", "web"]);
+        let s = sftp_args("web");
+        assert_eq!(&s[s.len() - 3..], ["--", "web", "sftp"]);
+    }
+}

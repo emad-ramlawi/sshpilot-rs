@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, to catch newly published advisories
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install GTK development packages
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable && rustup component add clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Security advisories (RustSec)
+        run: cargo install cargo-audit --locked && cargo audit

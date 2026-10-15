@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SSH Pilot RS
+Comment=Your ~/.ssh/config hosts in sorted groups, with terminal and file manager
+Exec=sshpilot-rs
+Icon=io.github.emad_ramlawi.SshPilotRs
+Terminal=false
+Categories=Network;RemoteAccess;GTK;
+Keywords=ssh;sftp;terminal;remote;server;
+StartupNotify=true
