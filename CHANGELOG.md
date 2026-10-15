@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 - Starts maximized; <kbd>F11</kbd> switches full screen on and off.
 
