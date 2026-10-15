@@ -296,6 +296,8 @@ fn build(application: &adw::Application) {
         .title("SSH Pilot RS")
         .default_width(1100)
         .default_height(700)
+        // Start maximized; the default size is for when it is restored.
+        .maximized(true)
         .build();
 
     // Sidebar: connection list with a single "+" menu.
@@ -496,6 +498,14 @@ fn build(application: &adw::Application) {
     window.add_action(&toggle_sidebar);
     font_button.set_popover(Some(&terminal::font_popover(&app)));
     application.set_accels_for_action("win.toggle-sidebar", &["F9"]);
+    let fullscreen = gio::SimpleAction::new("fullscreen", None);
+    fullscreen.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| window.set_fullscreened(!window.is_fullscreen())
+    ));
+    window.add_action(&fullscreen);
+    application.set_accels_for_action("win.fullscreen", &["F11"]);
     for (name, larger) in [
         ("zoom-in", Some(true)),
         ("zoom-out", Some(false)),

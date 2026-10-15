@@ -30,6 +30,7 @@
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd> | Copy / paste in a terminal |
 | <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | Larger / smaller / default terminal text |
 | <kbd>F9</kbd> | Fold or show the connections panel |
+| <kbd>F11</kbd> | Full screen on or off (the app starts maximized) |
 | <kbd>Enter</kbd> or double-click | Open a terminal to the selected host; in the file manager, open a folder or send a file across |
 
 ## Install

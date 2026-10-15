@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Starts maximized; <kbd>F11</kbd> switches full screen on and off.
+
 ## 0.2.0
 
 Faster, steadier for long sessions, and the look of sshPilot.
