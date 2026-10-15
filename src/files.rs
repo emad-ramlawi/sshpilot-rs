@@ -1,6 +1,6 @@
 //! A file manager tab: your files on the left, the server's on the right,
-//! with Upload and Download between them. SFTP is spoken over the system
-//! `ssh` (see `ssh::sftp_args`).
+//! with Upload under yours and Download under the server's. SFTP is spoken
+//! over the system `ssh` (see `ssh::sftp_args`).
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -67,9 +67,9 @@ struct Browser {
     waiting: RefCell<Vec<Waiting>>,
     /// The tab is closed: don't start or keep a session.
     closed: Cell<bool>,
-    /// My Files (this computer).
+    /// Local: this computer.
     local: Pane,
-    /// Server Files.
+    /// The server.
     remote: Pane,
     status: gtk::Label,
     progress: Progress,
@@ -672,7 +672,7 @@ pub fn open(app: &Rc<App>, alias: &str) {
     });
     let (local, remote) = (&browser.local, &browser.remote);
 
-    // My Files.
+    // Local side.
     local.up.connect_clicked(glib::clone!(
         #[strong]
         browser,
@@ -713,7 +713,7 @@ pub fn open(app: &Rc<App>, alias: &str) {
         ));
     }
 
-    // Server Files.
+    // Server side.
     remote.up.connect_clicked(glib::clone!(
         #[strong]
         browser,
@@ -777,7 +777,7 @@ pub fn open(app: &Rc<App>, alias: &str) {
         pane.list.add_controller(menu_click);
     }
 
-    // Drop files from the desktop on Server Files to upload them.
+    // Drop files from the desktop on the server side to upload them.
     let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
     drop.connect_drop(glib::clone!(
         #[strong]
@@ -914,7 +914,7 @@ impl Browser {
         }
     }
 
-    /// Show `target` in My Files.
+    /// Show `target` on the local side.
     fn navigate_local(self: &Rc<Self>, target: String) {
         let this = self.clone();
         spawn(
@@ -934,7 +934,7 @@ impl Browser {
         self.navigate_local(cwd);
     }
 
-    /// Show `target` in Server Files, connecting first if needed.
+    /// Show `target` on the server side, connecting first if needed.
     fn navigate(self: &Rc<Self>, target: String) {
         self.list_remote(target, true);
     }
@@ -1006,10 +1006,10 @@ impl Browser {
         sidebar::popup_menu(pane.list.upcast_ref(), x, y, items);
     }
 
-    /// Copy server files into the folder shown in My Files.
+    /// Copy server files into the folder shown on the local side.
     fn download(self: &Rc<Self>, targets: Vec<Entry>) {
         if targets.is_empty() {
-            self.say("Select files in Server Files first.");
+            self.say("Select files on the server side first.");
             return;
         }
         let files: Vec<Entry> = targets.into_iter().filter(|e| !e.dir).collect();
@@ -1038,10 +1038,10 @@ impl Browser {
         });
     }
 
-    /// Copy files selected in My Files to the folder shown in Server Files.
+    /// Copy files selected on the local side to the folder shown on the server side.
     fn upload_entries(self: &Rc<Self>, targets: Vec<Entry>) {
         if targets.is_empty() {
-            self.say("Select files in My Files first.");
+            self.say("Select files on the local side first.");
             return;
         }
         if targets.iter().all(|e| e.dir) {

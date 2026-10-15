@@ -19,7 +19,18 @@
 - **The look you know from sshPilot.** White on black with the Tango palette (as in GNOME Terminal), tabs in the title bar, color file icons. Pick the terminal font and size with the **Aa** button at the top (monospace fonts only, applied as you choose); until you do, it uses the font set in sshPilot if you have it, else `Monospace 12`. Zoom with the − / + buttons, or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd>.
 - **File manager.** Right-click a host and choose **Open Files**: your files on the left, the server's on the right (SFTP), listed by name, size and date. Select files and press **Upload** (under yours) or **Download** (under the server's), double-click a file to send it across, or drag files from your desktop onto the server side. The eye button shows hidden files. A progress bar shows how far transfers are, with their speed. New folder, rename and delete on the server from the right-click menu. If the host needs a password, open a terminal to it first: the files tab reuses that login.
 - **Fast, and fine to leave open all day.** Tabs to the same host share one SSH login, so a second terminal or the file manager opens instantly. Keep-alives hold idle connections through NAT and firewall timeouts, and the file manager reconnects by itself if a connection drops. Transfers keep many requests in flight, so they run at full speed on slow links too.
-- **Few buttons.** One **+** in the sidebar (new connection, new group, local terminal); everything else lives in the right-click menu.
+- **Few buttons.** One **+** in the sidebar (new connection, new group, local terminal), and the font and text size at the top right; everything else lives in the right-click menus.
+
+### Keyboard shortcuts
+
+| Keys | Does |
+| --- | --- |
+| <kbd>Ctrl</kbd>+<kbd>N</kbd> | New connection (adds a `Host` to `~/.ssh/config`) |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> | New local terminal |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd> | Copy / paste in a terminal |
+| <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | Larger / smaller / default terminal text |
+| <kbd>F9</kbd> | Fold or show the connections panel |
+| <kbd>Enter</kbd> or double-click | Open a terminal to the selected host; in the file manager, open a folder or send a file across |
 
 ## Install
 
@@ -55,6 +66,9 @@ Requires GTK ≥ 4.12, libadwaita ≥ 1.5, and VTE (GTK 4 build) ≥ 0.76.
 | Hosts | `~/.ssh/config`. **New Connection** only *appends* a `Host` block; the app never rewrites or reorders your file. |
 | Groups, order, terminal font and size, panel folded | `~/.config/sshpilot-rs/layout.json` (aliases only, mode `0600`) |
 | Passwords | Nowhere. OpenSSH asks for them in the terminal. |
+| Shared connections, icon copies | `$XDG_RUNTIME_DIR/sshpilot-rs/` (private `0700` folder in memory, cleared at logout) |
+| Menu entry and icon | `~/.local/share/applications/` and `~/.local/share/icons/`, only if you run `--install` |
+| Read, never written | `~/.config/sshpilot/config.json`, if you used sshPilot: only its terminal font, as the default until you pick one |
 
 ## Why a Rust rewrite
 
@@ -63,7 +77,7 @@ This project is inspired by [sshPilot](https://github.com/mfat/sshpilot) by mfat
 What Rust brings here:
 
 - **Memory safety without a garbage collector.** Buffer overflows, use-after-free and data races, the bug classes behind most security advisories in C/C++ code, are ruled out at compile time in this codebase.
-- **One small native binary.** About 1.2 MB, with no Python interpreter or pip packages to install. Put it anywhere and run it.
+- **One small native binary.** About 1.3 MB, with no Python interpreter or pip packages to install. Put it anywhere and run it.
 - **Fast and light.** No interpreter startup and no daemon of its own. SSH and SFTP run on a small async runtime (Tokio) next to the UI thread, so a slow server never freezes the window.
 - **Checked dependencies.** Dependencies are pinned in `Cargo.lock` and checked against the [RustSec advisory database](https://rustsec.org/) with `cargo audit` in CI.
 
@@ -89,6 +103,16 @@ scripts/install.sh             # build, install to ~/.local/bin, add menu entry 
 scripts/package.sh             # dist/sshpilot-rs-<version>-linux-<arch> (+ .sha256) for this machine
 scripts/dist.sh                # amd64 + arm64 binaries, built in Ubuntu 24.04 containers (podman/docker)
 ```
+
+Two more tests need an SSH server you can log in to with a key; point them at a `Host` in an ssh config file:
+
+```sh
+export SSHPILOT_RS_TEST_HOST=myhost SSHPILOT_RS_TEST_SSH_CONFIG=~/.ssh/config
+cargo test -- --ignored sftp_round_trip                        # upload, download, rename, delete
+cargo test --release -- --ignored --nocapture sftp_speed       # transfer speed, tuned vs. library defaults
+```
+
+Releases: add the version's notes to [CHANGELOG.md](CHANGELOG.md), bump `version` in `Cargo.toml`, and push a `v<version>` tag. GitHub Actions builds the amd64 and arm64 binaries and publishes them with those notes.
 
 ## License
 
