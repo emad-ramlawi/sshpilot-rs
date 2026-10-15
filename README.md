@@ -11,15 +11,16 @@
 
 ---
 
-## What it does
+## Features
 
-- **Uses your `~/.ssh/config`.** Every `Host` in it (and in the files it `Include`s) shows up in the sidebar. Addresses, users, ports, keys, `ProxyJump`, agents: all of it is plain OpenSSH, so whatever works with `ssh myhost` works here. Save the file and the list updates.
-- **Groups and manual sorting.** Drag connections up and down, into and out of groups, and drag groups to reorder them. The order you set is the order you keep. The arrow at the top right of the list (or <kbd>F9</kbd>) folds the whole panel away; it stays that way next time.
-- **Terminal tabs.** Double-click a host to open a terminal running `ssh` in a tab. The app starts with a local terminal open, running your login shell (bash, zsh, fish, …, as set with `chsh`); **New Local Terminal** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd>, or click the app icon in the top-left corner) opens another. Right-click a tab to **Duplicate** it (a local terminal's copy starts in the folder you are in) or **Open Files** on its host. A tab closes when its session ends (`exit`, <kbd>Ctrl</kbd>+<kbd>D</kbd>); if `ssh` itself fails (can't connect, login refused, connection lost), the tab stays open so you can read the error. Copy and paste with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>V</kbd>.
-- **The look you know from sshPilot.** White on black with the Tango palette (as in GNOME Terminal), tabs in the title bar, color file icons. Pick the terminal font and size with the **Aa** button at the top (monospace fonts only, applied as you choose); until you do, it uses the font set in sshPilot if you have it, else `Monospace 12`. Zoom with the − / + buttons, or <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd>.
-- **File manager.** Right-click a host and choose **Open Files**: your files on the left, the server's on the right (SFTP), listed by name, size and date. Select files and press **Upload** (under yours) or **Download** (under the server's), double-click a file to send it across, or drag files from your desktop onto the server side. The eye button shows hidden files. A progress bar shows how far transfers are, with their speed. New folder, rename and delete on the server from the right-click menu. If the host needs a password, open a terminal to it first: the files tab reuses that login.
-- **Fast, and fine to leave open all day.** Tabs to the same host share one SSH login, so a second terminal or the file manager opens instantly. Keep-alives hold idle connections through NAT and firewall timeouts, and the file manager reconnects by itself if a connection drops. Transfers keep many requests in flight, so they run at full speed on slow links too.
-- **Few buttons.** One **+** in the sidebar (new connection, new group, local terminal), and the font and text size at the top right; everything else lives in the right-click menus.
+- **Your `~/.ssh/config`, as is.** Every `Host` (including `Include`d files) appears in the sidebar and updates when you save the file. It's plain OpenSSH, so keys, agents and `ProxyJump` work as they do with `ssh`.
+- **Groups you sort by hand.** Drag hosts and groups into any order; it's kept. Fold the panel away with the arrow or <kbd>F9</kbd>.
+- **Terminal tabs.** Double-click a host for an `ssh` tab. Local terminals run your login shell (bash, zsh, fish…); one opens at launch, more from **+**, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> or the app icon in the top-left corner.
+  - Right-click a tab to **Duplicate** it (a local copy starts in the same folder) or **Open Files**.
+  - A tab closes when its session ends; if `ssh` fails, it stays open showing the error.
+- **File manager.** Right-click a host → **Open Files**: your files left, the server's right (name, size, date; the eye shows hidden files), with **Upload** / **Download**, drag and drop from the desktop, a progress bar with speed, and new folder / rename / delete. It reuses the terminal's login, so for password hosts open a terminal first.
+- **sshPilot's look.** White on black (Tango palette), tabs in the title bar, color file icons. Font and size from the **Aa** button (defaults to your sshPilot font, else `Monospace 12`); zoom with − / +.
+- **Built for long sessions.** Tabs to one host share a single login, so new tabs open instantly. Keep-alives survive idle NAT and firewall timeouts, and the file manager reconnects on its own.
 
 ### Keyboard shortcuts
 
@@ -35,7 +36,7 @@
 
 ## Install
 
-Download the binary for your machine from the [Releases page](https://github.com/emad-ramlawi/sshpilot-rs/releases): `linux-amd64` for Intel/AMD, `linux-arm64` for ARM (Raspberry Pi 4/5, Ampere, Snapdragon laptops). Each has a `.sha256` next to it.
+Get the binary for your machine from [Releases](https://github.com/emad-ramlawi/sshpilot-rs/releases): `linux-amd64` (Intel/AMD) or `linux-arm64` (Raspberry Pi 4/5, Ampere, Snapdragon laptops), each with a `.sha256`.
 
 ```sh
 sha256sum -c sshpilot-rs-*-linux-amd64.sha256      # optional: check the download
@@ -43,22 +44,17 @@ install -Dm 755 sshpilot-rs-*-linux-amd64 ~/.local/bin/sshpilot-rs
 ~/.local/bin/sshpilot-rs --install                 # app menu entry and icon
 ```
 
-That's it. Open **SSH Pilot RS** from your app menu, or run `sshpilot-rs` (if `~/.local/bin` is on your `PATH`). For all users, install to `/usr/local/bin` with `sudo` instead; each user then runs `--install` once.
-
-`--install` downloads nothing: it writes two files under `~/.local/share`, a `.desktop` entry that starts the binary you ran it from, and the icon. They matter on Wayland: the desktop finds the window's icon through the `.desktop` file, so without them you get a generic one.
-
-- **Update:** download the new binary and replace the old one at the same path (the `install` line above). The menu entry keeps pointing there, so you don't need `--install` again (only if you move the binary).
+- **`--install`** writes a `.desktop` entry and the icon under `~/.local/share` (nothing is downloaded). Wayland needs them to show the right window icon. For all users, put the binary in `/usr/local/bin` and have each user run `--install`.
+- **Update:** replace the binary at the same path; no need to rerun `--install`.
 - **Uninstall:** `sshpilot-rs --uninstall`, then delete the binary.
 
-The binary uses your system's GTK libraries and `ssh`. Most desktops already have them; if not:
+It uses your system's GTK, libadwaita, VTE and `ssh` (GTK ≥ 4.12, libadwaita ≥ 1.5, VTE GTK 4 ≥ 0.76). If any are missing:
 
 | Distribution | Command |
 | --- | --- |
 | Debian 13+, Ubuntu 24.04+ | `sudo apt install libgtk-4-1 libadwaita-1-0 libvte-2.91-gtk4-0 openssh-client` |
 | Fedora 40+ | `sudo dnf install gtk4 libadwaita vte291-gtk4 openssh-clients` |
 | Arch, CachyOS, Manjaro | `sudo pacman -S gtk4 libadwaita vte4 openssh` |
-
-Requires GTK ≥ 4.12, libadwaita ≥ 1.5, and VTE (GTK 4 build) ≥ 0.76.
 
 ## Where things are stored
 
@@ -71,27 +67,18 @@ Requires GTK ≥ 4.12, libadwaita ≥ 1.5, and VTE (GTK 4 build) ≥ 0.76.
 | Menu entry and icon | `~/.local/share/applications/` and `~/.local/share/icons/`, only if you run `--install` |
 | Read, never written | `~/.config/sshpilot/config.json`, if you used sshPilot: only its terminal font, as the default until you pick one |
 
-## Why a Rust rewrite
+## Security
 
-This project is inspired by [sshPilot](https://github.com/mfat/sshpilot) by mfat. sshPilot has a lot of features; I wanted a much smaller app whose bugs I could fix and ship on my own schedule. It was written from scratch: no code is shared, and the artwork is new.
+- **Nothing extra running or stored.** No daemon, listening sockets, telemetry or update checks. Authentication is all OpenSSH (keys, agent, `known_hosts`); no secrets are saved.
+- **No shell injection.** `ssh` gets an argument list (never `sh -c`) with the alias after `--`, so `-oProxyCommand=…` tricks can't work. New entries are validated before they're written.
+- **Safe connection sharing.** The file manager never prompts (`BatchMode=yes`); it reuses the terminal's connection through a socket in your private runtime folder. If `$XDG_RUNTIME_DIR` isn't really private (yours, `0700`, not a symlink, e.g. a shared `/tmp`), sharing is turned off instead. The shared connection outlives single tabs, closes 10 minutes after the last one (`ControlPersist=10m`) or when the app quits, and keep-alives (`ServerAliveInterval=30`, `ServerAliveCountMax=4`) catch a dead link within about two minutes.
+- **Hostile servers stay contained.** Remote names with `/`, `..` or NUL are ignored. Downloads never overwrite local files, uploads never replace remote ones (exclusive create), failed transfers leave nothing behind, and recursive delete never follows symlinks.
+- **Private files.** `layout.json` is written atomically with mode `0600`.
+- **Checked supply chain.** Dependencies are locked and audited against [RustSec](https://rustsec.org/) in CI; GitHub Actions are pinned to exact commits and only the publish step can write to the repo.
 
-What Rust brings here:
+## Why Rust
 
-- **Memory safety without a garbage collector.** Buffer overflows, use-after-free and data races, the bug classes behind most security advisories in C/C++ code, are ruled out at compile time in this codebase.
-- **One small native binary.** About 1.3 MB, with no Python interpreter or pip packages to install. Put it anywhere and run it.
-- **Fast and light.** No interpreter startup and no daemon of its own. SSH and SFTP run on a small async runtime (Tokio) next to the UI thread, so a slow server never freezes the window.
-- **Checked dependencies.** Dependencies are pinned in `Cargo.lock` and checked against the [RustSec advisory database](https://rustsec.org/) with `cargo audit` in CI. The build workflows pin each GitHub Action to an exact commit, and only the final publish step may write to the repository.
-
-To be fair to C: the GUI toolkit (GTK, libadwaita, VTE) and `ssh` are still the system's own C programs. You get those from your distribution, with its security updates.
-
-## Security design
-
-- **No daemon, no listening sockets, no telemetry, no update checker.** One app process, plus what its tabs run: your shell in local terminals, the system `ssh` in the others, and one shared connection per host (below).
-- **No stored secrets.** Authentication is entirely OpenSSH: keys, agent, `known_hosts`, prompts in the terminal.
-- **No shell in between.** `ssh` is started with an argument list, never through `sh -c`, and the alias always follows `--`, so it can never be read as an option (blocks `-oProxyCommand=…` style injection). New entries are validated before they are written.
-- **SFTP never prompts** (`BatchMode=yes`). It reuses the terminal's connection through a multiplexing socket in a private `0700` folder under `$XDG_RUNTIME_DIR`, used only if that runtime folder really is private (yours, `0700`, not a symlink); a shared one such as `/tmp` would let another user plant a fake socket, so sharing is then turned off. That shared connection runs in its own background `ssh`, so closing one tab never cuts another tab to the same host. It closes 10 minutes after its last tab (`ControlPersist=10m`), so reopening is instant, and right away when the app quits. Keep-alives (`ServerAliveInterval=30`, `ServerAliveCountMax=4`) notice a dead link within about two minutes.
-- **Hostile servers can't write outside your folder.** Remote file names containing `/`, `..` or NUL are ignored, downloads never overwrite an existing file (and a failed one leaves nothing behind), uploads never replace a remote file (exclusive create, no check-then-write race), and recursive delete never follows symlinks.
-- **Private files.** The layout file is written atomically with mode `0600`.
+Inspired by [sshPilot](https://github.com/mfat/sshpilot) by mfat, written from scratch as a much smaller app (no shared code, new artwork). Rust rules out memory-safety bugs such as buffer overflows and use-after-free at compile time, and builds one native binary of about 1.3 MB with no interpreter. SSH and SFTP run on a small async runtime (Tokio), so a slow server never freezes the window. GTK, libadwaita, VTE and `ssh` are still your distribution's C libraries, with its security updates.
 
 ## Build from source
 
@@ -105,7 +92,7 @@ scripts/package.sh             # dist/sshpilot-rs-<version>-linux-<arch> (+ .sha
 scripts/dist.sh                # amd64 + arm64 binaries, built in Ubuntu 24.04 containers (podman/docker)
 ```
 
-Two more tests need an SSH server you can log in to with a key; point them at a `Host` in an ssh config file:
+Two tests need an SSH server you can log in to with a key:
 
 ```sh
 export SSHPILOT_RS_TEST_HOST=myhost SSHPILOT_RS_TEST_SSH_CONFIG=~/.ssh/config
@@ -113,10 +100,8 @@ cargo test -- --ignored sftp_round_trip                        # upload, downloa
 cargo test --release -- --ignored --nocapture sftp_speed       # transfer speed, tuned vs. library defaults
 ```
 
-Releases: add the version's notes to [CHANGELOG.md](CHANGELOG.md), bump `version` in `Cargo.toml`, and push a `v<version>` tag. GitHub Actions builds the amd64 and arm64 binaries and publishes them with those notes.
+**Releasing:** add notes to [CHANGELOG.md](CHANGELOG.md), bump `version` in `Cargo.toml`, push a `v<version>` tag. GitHub Actions builds both binaries and publishes them with those notes.
 
 ## License
 
-GPL-3.0-or-later, the same license as sshPilot. See [LICENSE](LICENSE).
-
-Not affiliated with or endorsed by the sshPilot project.
+GPL-3.0-or-later, the same license as sshPilot. See [LICENSE](LICENSE). Not affiliated with or endorsed by the sshPilot project.
