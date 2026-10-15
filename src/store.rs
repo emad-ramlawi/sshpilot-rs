@@ -1,5 +1,6 @@
 //! Hosts come from `~/.ssh/config`; this app only remembers how you arranged
-//! them: groups and the manual order (the order of the vectors).
+//! them (groups and the manual order: the order of the vectors) and a few
+//! view settings (terminal font and text size, the folded panel).
 
 use std::fs;
 use std::io::Write;

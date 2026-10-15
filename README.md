@@ -86,9 +86,9 @@ To be fair to C: the GUI toolkit (GTK, libadwaita, VTE) and `ssh` are still the 
 
 ## Security design
 
-- **No daemon, no listening sockets, no telemetry, no update checker.** One app process, plus the system `ssh`: one process per open tab, and one shared connection per host (below).
+- **No daemon, no listening sockets, no telemetry, no update checker.** One app process, plus what its tabs run: your shell in local terminals, the system `ssh` in the others, and one shared connection per host (below).
 - **No stored secrets.** Authentication is entirely OpenSSH: keys, agent, `known_hosts`, prompts in the terminal.
-- **No shell.** `ssh` is started with an argument list, never through `sh -c`, and the alias always follows `--`, so it can never be read as an option (blocks `-oProxyCommand=…` style injection). New entries are validated before they are written.
+- **No shell in between.** `ssh` is started with an argument list, never through `sh -c`, and the alias always follows `--`, so it can never be read as an option (blocks `-oProxyCommand=…` style injection). New entries are validated before they are written.
 - **SFTP never prompts** (`BatchMode=yes`). It reuses the terminal's connection through a multiplexing socket in a private `0700` folder under `$XDG_RUNTIME_DIR`. That shared connection runs in its own background `ssh`, so closing one tab never cuts another tab to the same host. It closes 10 minutes after its last tab (`ControlPersist=10m`), so reopening is instant, and right away when the app quits. Keep-alives (`ServerAliveInterval=30`, `ServerAliveCountMax=4`) notice a dead link within about two minutes.
 - **Hostile servers can't write outside your folder.** Remote file names containing `/`, `..` or NUL are ignored, downloads never overwrite an existing file (and a failed one leaves nothing behind), uploads never replace a remote file (exclusive create, no check-then-write race), and recursive delete never follows symlinks.
 - **Private files.** The layout file is written atomically with mode `0600`.
