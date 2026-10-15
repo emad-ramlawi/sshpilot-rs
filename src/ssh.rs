@@ -7,8 +7,10 @@
 //!
 //! The shared connection runs in its own background ssh (`ControlPersist`),
 //! not inside the first tab: otherwise closing that tab would cut every other
-//! tab to the same host. It ends a minute after its last tab closes, and the
-//! app ends it right away when it quits (`exit_args`).
+//! tab to the same host. It stays up 10 minutes after its last tab closes,
+//! so reopening a tab is instant (no new login), and the app ends it right
+//! away when it quits (`exit_args`). Keep-alives keep idle sessions through
+//! NAT/firewall timeouts and notice a dead link within about two minutes.
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -33,6 +35,12 @@ fn control_dir() -> Option<PathBuf> {
 
 fn base_args() -> Vec<String> {
     let mut args = vec!["ssh".to_owned()];
+    args.extend([
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "ServerAliveCountMax=4".into(),
+    ]);
     if let Some(dir) = control_dir() {
         args.extend([
             "-o".into(),
@@ -40,7 +48,7 @@ fn base_args() -> Vec<String> {
             "-o".into(),
             format!("ControlPath={}/%C", dir.display()),
             "-o".into(),
-            "ControlPersist=60".into(),
+            "ControlPersist=10m".into(),
         ]);
     }
     args

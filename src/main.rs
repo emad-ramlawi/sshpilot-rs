@@ -24,6 +24,17 @@ const CSS: &str = "
 row.drop-before { box-shadow: inset 0 2px @accent_color; }
 row.drop-after { box-shadow: inset 0 -2px @accent_color; }
 row.drop-into { background-color: alpha(@accent_color, 0.2); }
+
+/* Connections: each host a separate, roomy card. */
+.connections > row.host {
+    padding: 9px 10px;
+    margin-top: 3px;
+    margin-bottom: 3px;
+    border: 1px solid alpha(currentColor, 0.1);
+}
+.connections > row.host:not(:hover):not(:selected) { background-color: alpha(currentColor, 0.03); }
+.connections > row.group { padding: 8px 10px; margin-top: 10px; }
+.connections .host-title { font-weight: bold; }
 ";
 
 /// One background runtime for SSH/SFTP I/O; the UI stays on the GTK thread.
@@ -66,6 +77,8 @@ pub struct App {
     pub toasts: adw::ToastOverlay,
     /// Terminal text size, shown between the zoom buttons.
     pub zoom_label: gtk::Label,
+    /// The tab whose right-click menu is open.
+    menu_page: RefCell<Option<adw::TabPage>>,
 }
 
 impl App {
@@ -175,6 +188,78 @@ impl App {
     }
 }
 
+/// The tabs' right-click menu: Duplicate, Open Files, Close.
+fn tab_menu(app: &Rc<App>) {
+    let menu = gio::Menu::new();
+    let open = gio::Menu::new();
+    open.append(Some("Duplicate"), Some("win.tab-duplicate"));
+    open.append(Some("Open Files"), Some("win.tab-files"));
+    menu.append_section(None, &open);
+    let close = gio::Menu::new();
+    close.append(Some("Close"), Some("win.tab-close"));
+    menu.append_section(None, &close);
+    app.tabs.set_menu_model(Some(&menu));
+
+    // The tab the menu is for, and its host ("" for a local terminal).
+    let target = |app: &App| {
+        let page = app.menu_page.borrow().clone()?;
+        let host = page.keyword().map(|k| k.to_string()).unwrap_or_default();
+        Some((page, host))
+    };
+    let duplicate = gio::SimpleAction::new("tab-duplicate", None);
+    duplicate.connect_activate(glib::clone!(
+        #[strong]
+        app,
+        move |_, _| {
+            let Some((page, host)) = target(&app) else {
+                return;
+            };
+            if !page.child().is::<vte4::Terminal>() {
+                files::open(&app, &host);
+            } else if host.is_empty() {
+                terminal::open_local(&app);
+            } else {
+                terminal::open(&app, &host);
+            }
+        }
+    ));
+    let open_files = gio::SimpleAction::new("tab-files", None);
+    open_files.connect_activate(glib::clone!(
+        #[strong]
+        app,
+        move |_, _| {
+            if let Some((_, host)) = target(&app).filter(|(_, host)| !host.is_empty()) {
+                files::open(&app, &host);
+            }
+        }
+    ));
+    let close_tab = gio::SimpleAction::new("tab-close", None);
+    close_tab.connect_activate(glib::clone!(
+        #[strong]
+        app,
+        move |_, _| {
+            if let Some((page, _)) = target(&app) {
+                app.tabs.close_page(&page);
+            }
+        }
+    ));
+    app.tabs.connect_setup_menu(glib::clone!(
+        #[strong]
+        app,
+        #[weak]
+        open_files,
+        move |_, page| {
+            *app.menu_page.borrow_mut() = page.cloned();
+            // A local terminal has no server to browse.
+            let host = page.and_then(|p| p.keyword()).unwrap_or_default();
+            open_files.set_enabled(!host.is_empty());
+        }
+    ));
+    for action in [&duplicate, &open_files, &close_tab] {
+        app.window.add_action(action);
+    }
+}
+
 fn build(application: &adw::Application) {
     // One window: a second launch only raises it (two would overwrite each
     // other's layout file).
@@ -214,6 +299,7 @@ fn build(application: &adw::Application) {
     // Sidebar: connection list with a single "+" menu.
     let list = gtk::ListBox::new();
     list.add_css_class("navigation-sidebar");
+    list.add_css_class("connections");
     list.set_activate_on_single_click(false);
     let add_menu = gio::Menu::new();
     add_menu.append(Some("New Connection"), Some("win.new-connection"));
@@ -227,6 +313,12 @@ fn build(application: &adw::Application) {
     let sidebar_header = adw::HeaderBar::new();
     sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("Connections", "")));
     sidebar_header.pack_start(&add_button);
+    let hide_sidebar = gtk::Button::builder()
+        .icon_name("pan-start-symbolic")
+        .tooltip_text("Hide Connections (F9)")
+        .action_name("win.toggle-sidebar")
+        .build();
+    sidebar_header.pack_end(&hide_sidebar);
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_top_bar(&sidebar_header);
     sidebar_view.set_content(Some(
@@ -274,6 +366,13 @@ fn build(application: &adw::Application) {
     }
     let content_header = adw::HeaderBar::new();
     content_header.pack_end(&zoom_box);
+    // Brings the connections panel back; only shown while it is hidden.
+    let show_sidebar = gtk::Button::builder()
+        .icon_name("pan-end-symbolic")
+        .tooltip_text("Show Connections (F9)")
+        .action_name("win.toggle-sidebar")
+        .build();
+    content_header.pack_start(&show_sidebar);
     let content_view = adw::ToolbarView::new();
     content_view.add_top_bar(&content_header);
     content_view.add_top_bar(&tab_bar);
@@ -294,7 +393,17 @@ fn build(application: &adw::Application) {
     let split = adw::OverlaySplitView::new();
     split.set_sidebar(Some(&sidebar_view));
     split.set_content(Some(&content_view));
-    split.set_min_sidebar_width(240.0);
+    split.set_min_sidebar_width(270.0);
+    split.set_max_sidebar_width(400.0);
+    split.set_sidebar_width_fraction(0.28);
+    let sidebar_hidden = layout.sidebar_hidden;
+    split.set_show_sidebar(!sidebar_hidden);
+    show_sidebar.set_visible(sidebar_hidden);
+    split.connect_show_sidebar_notify(glib::clone!(
+        #[weak]
+        show_sidebar,
+        move |split| show_sidebar.set_visible(!split.shows_sidebar())
+    ));
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&split));
@@ -313,6 +422,7 @@ fn build(application: &adw::Application) {
         tabs,
         toasts,
         zoom_label,
+        menu_page: RefCell::default(),
     });
     terminal::show_zoom(&app);
 
@@ -337,6 +447,25 @@ fn build(application: &adw::Application) {
     window.add_action(&new_connection);
     window.add_action(&new_group);
     window.add_action(&local_terminal);
+    tab_menu(&app);
+    let toggle_sidebar = gio::SimpleAction::new("toggle-sidebar", None);
+    toggle_sidebar.connect_activate(glib::clone!(
+        #[strong]
+        app,
+        #[weak]
+        split,
+        move |_, _| {
+            let hidden = split.shows_sidebar();
+            split.set_show_sidebar(!hidden);
+            // Remembered for the next launch.
+            app.layout.borrow_mut().sidebar_hidden = hidden;
+            if let Err(e) = app.layout.borrow().save(&app.path) {
+                app.toast(&e.to_string());
+            }
+        }
+    ));
+    window.add_action(&toggle_sidebar);
+    application.set_accels_for_action("win.toggle-sidebar", &["F9"]);
     for (name, larger) in [
         ("zoom-in", Some(true)),
         ("zoom-out", Some(false)),
@@ -370,6 +499,8 @@ fn build(application: &adw::Application) {
         app.toast(&error);
     }
     window.present();
+    // Start with a local terminal, ready to type in.
+    terminal::open_local(&app);
 }
 
 const USAGE: &str = "\

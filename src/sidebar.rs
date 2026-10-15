@@ -141,6 +141,7 @@ fn group_row(id: Id, name: &str, count: usize, collapsed: bool) -> gtk::ListBoxR
     let row = gtk::ListBoxRow::builder()
         .child(&content)
         .selectable(false)
+        .css_classes(["group"])
         .build();
     add_drag_source(&row, Dragged::Group(id));
     row
@@ -158,16 +159,24 @@ fn host_row(app: &Rc<App>, alias: &str, nested: bool) -> gtk::ListBoxRow {
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
+    title.add_css_class("host-title");
     subtitle.add_css_class("caption");
     subtitle.add_css_class("dim-label");
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.append(&title);
     text.append(&subtitle);
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    content.set_margin_start(if nested { 18 } else { 0 });
-    content.append(&gtk::Image::from_icon_name("utilities-terminal-symbolic"));
+    let icon = gtk::Image::from_icon_name("utilities-terminal-symbolic");
+    icon.set_pixel_size(20);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    content.append(&icon);
     content.append(&text);
-    let row = gtk::ListBoxRow::builder().child(&content).build();
+    let row = gtk::ListBoxRow::builder()
+        .child(&content)
+        .css_classes(["host"])
+        .build();
+    if nested {
+        row.set_margin_start(16);
+    }
     add_drag_source(&row, Dragged::Host(alias.to_owned()));
     row
 }

@@ -343,6 +343,9 @@ pub struct Layout {
     /// Terminal text size, 1.0 = the system's monospace font size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_scale: Option<f64>,
+    /// The connections panel is folded away.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidebar_hidden: bool,
 }
 
 impl Layout {

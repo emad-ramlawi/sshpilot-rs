@@ -9,13 +9,16 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use anyhow::{Context, Result, bail};
 use gtk::{gdk, gio, glib};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 
 use crate::{App, dialogs, sidebar, spawn, ssh, store};
 
@@ -44,6 +47,8 @@ struct Pane {
     entries: RefCell<Vec<Entry>>,
 }
 
+type Waiting = Box<dyn FnOnce(&Rc<Browser>, Arc<SftpSession>)>;
+
 struct Browser {
     app: Rc<App>,
     alias: String,
@@ -51,6 +56,8 @@ struct Browser {
     /// Keeps the `ssh` process alive for as long as the tab is open.
     ssh: RefCell<Option<tokio::process::Child>>,
     connecting: Cell<bool>,
+    /// Actions waiting for the connection being made.
+    waiting: RefCell<Vec<Waiting>>,
     /// The tab is closed: don't start or keep a session.
     closed: Cell<bool>,
     /// My Files (this computer).
@@ -58,6 +65,40 @@ struct Browser {
     /// Server Files.
     remote: Pane,
     status: gtk::Label,
+    progress: Progress,
+}
+
+/// Running transfers, shown as one progress bar.
+struct Progress {
+    bar: gtk::ProgressBar,
+    /// Bytes moved so far and expected size, per transfer.
+    items: RefCell<Vec<(Arc<AtomicU64>, u64)>>,
+    uploads: Cell<usize>,
+    downloads: Cell<usize>,
+    /// For the speed: bytes done at the last update, and when.
+    last: Cell<(Instant, u64)>,
+    speed: Cell<f64>,
+    timer: RefCell<Option<glib::SourceId>>,
+}
+
+/// Counts the bytes read through it, for the progress bar.
+struct Counted<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let read = buf.filled().len() - before;
+        self.count.fetch_add(read as u64, Ordering::Relaxed);
+        result
+    }
 }
 
 /// A remote name that is safe to show and to use as a local file name.
@@ -111,7 +152,28 @@ fn free_local_path(dir: &Path, name: &str) -> PathBuf {
         .expect("some free name")
 }
 
+/// SFTP tuning for speed on slow links and long, idle sessions.
+fn sftp_config() -> russh_sftp::client::Config {
+    russh_sftp::client::Config {
+        // Writes fill OpenSSH's 2 MB channel window like reads already do
+        // (the default is 16 x 32 KB), for full speed on slow links.
+        max_write_packet_len: 128 * 1024,
+        max_concurrent_writes: 32,
+        // Busy servers and big folders can take a while; a dead link is
+        // caught by ssh's keep-alives instead.
+        request_timeout_secs: 60,
+        ..Default::default()
+    }
+}
+
 async fn connect(args: Vec<String>) -> Result<(SftpSession, tokio::process::Child)> {
+    connect_with(args, sftp_config()).await
+}
+
+async fn connect_with(
+    args: Vec<String>,
+    config: russh_sftp::client::Config,
+) -> Result<(SftpSession, tokio::process::Child)> {
     let mut child = tokio::process::Command::new(&args[0])
         .args(&args[1..])
         .stdin(Stdio::piped())
@@ -123,7 +185,7 @@ async fn connect(args: Vec<String>) -> Result<(SftpSession, tokio::process::Chil
     let stdin = child.stdin.take().context("ssh stdin")?;
     let stdout = child.stdout.take().context("ssh stdout")?;
     let mut stderr = child.stderr.take().context("ssh stderr")?;
-    match SftpSession::new(tokio::io::join(stdout, stdin)).await {
+    match SftpSession::new_with_config(tokio::io::join(stdout, stdin), config).await {
         Ok(sftp) => {
             // Keep draining ssh's messages so it never blocks on a full pipe.
             tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await });
@@ -187,16 +249,25 @@ fn remove_all(
     })
 }
 
+const TRANSFER_BUFFER: usize = 1024 * 1024;
+
 /// Copy a remote file to a new local file; a failed copy leaves no file behind.
-async fn download(sftp: Arc<SftpSession>, remote: String, local: PathBuf) -> Result<()> {
-    let mut source = sftp.open(remote).await?;
+async fn download(
+    sftp: Arc<SftpSession>,
+    remote: String,
+    local: PathBuf,
+    count: Arc<AtomicU64>,
+) -> Result<()> {
+    // Large buffers: few local writes and full-size SFTP requests.
+    let inner = sftp.open(remote).await?;
+    let mut source = BufReader::with_capacity(TRANSFER_BUFFER, Counted { inner, count });
     let mut target = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&local)
         .await?;
     let copied = async {
-        tokio::io::copy(&mut source, &mut target).await?;
+        tokio::io::copy_buf(&mut source, &mut target).await?;
         target.flush().await
     }
     .await;
@@ -209,8 +280,14 @@ async fn download(sftp: Arc<SftpSession>, remote: String, local: PathBuf) -> Res
 }
 
 /// Copy a local file to a new remote file; never replaces one that exists.
-async fn upload(sftp: Arc<SftpSession>, local: PathBuf, remote: String) -> Result<()> {
-    let mut source = tokio::fs::File::open(&local).await?;
+async fn upload(
+    sftp: Arc<SftpSession>,
+    local: PathBuf,
+    remote: String,
+    count: Arc<AtomicU64>,
+) -> Result<()> {
+    let inner = tokio::fs::File::open(&local).await?;
+    let mut source = BufReader::with_capacity(TRANSFER_BUFFER, Counted { inner, count });
     // EXCLUDE makes the server refuse an existing name, with no check-then-create race.
     let opened = sftp
         .open_with_flags(
@@ -229,7 +306,7 @@ async fn upload(sftp: Arc<SftpSession>, local: PathBuf, remote: String) -> Resul
         }
     };
     let copied = async {
-        tokio::io::copy(&mut source, &mut target).await?;
+        tokio::io::copy_buf(&mut source, &mut target).await?;
         target.shutdown().await
     }
     .await;
@@ -458,7 +535,14 @@ pub fn open(app: &Rc<App>, alias: &str) {
     status.add_css_class("caption");
 
     let page_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let bar = gtk::ProgressBar::builder()
+        .show_text(true)
+        .visible(false)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
     page_box.append(&panes);
+    page_box.append(&bar);
     page_box.append(&status);
 
     let browser = Rc::new(Browser {
@@ -467,10 +551,20 @@ pub fn open(app: &Rc<App>, alias: &str) {
         sftp: RefCell::new(None),
         ssh: RefCell::new(None),
         connecting: Cell::new(false),
+        waiting: RefCell::default(),
         closed: Cell::new(false),
         local,
         remote,
         status,
+        progress: Progress {
+            bar,
+            items: RefCell::default(),
+            uploads: Cell::new(0),
+            downloads: Cell::new(0),
+            last: Cell::new((Instant::now(), 0)),
+            speed: Cell::new(0.0),
+            timer: RefCell::default(),
+        },
     });
     let (local, remote) = (&browser.local, &browser.remote);
 
@@ -585,6 +679,7 @@ pub fn open(app: &Rc<App>, alias: &str) {
     app.connected_to(alias);
     let page = app.tabs.append(&page_box);
     page.set_title(&format!("Files — {alias}"));
+    page.set_keyword(alias);
     page.set_icon(Some(&gio::ThemedIcon::new("folder-remote-symbolic")));
     app.tabs.set_selected_page(&page);
 
@@ -647,6 +742,62 @@ impl Browser {
         }
     }
 
+    /// Run `then` with a live session, connecting (again) first if needed:
+    /// after a long idle or a dropped link, the next action just reconnects.
+    /// Actions asked for while connecting wait for that connection.
+    fn with_session(self: &Rc<Self>, then: impl FnOnce(&Rc<Browser>, Arc<SftpSession>) + 'static) {
+        if self.closed.get() {
+            return;
+        }
+        self.drop_if_dead();
+        let live = self.sftp.borrow().clone();
+        if let Some(sftp) = live {
+            then(self, sftp);
+            return;
+        }
+        self.waiting.borrow_mut().push(Box::new(then));
+        if self.connecting.replace(true) {
+            return;
+        }
+        self.say(&format!("Connecting to {}…", self.alias));
+        let this = self.clone();
+        spawn(connect(ssh::sftp_args(&self.alias)), move |result| {
+            this.connecting.set(false);
+            let waiting = this.waiting.take();
+            if this.closed.get() {
+                // The tab closed meanwhile; dropping the session ends its ssh.
+                return;
+            }
+            match result {
+                Ok((sftp, child)) => {
+                    let sftp = Arc::new(sftp);
+                    *this.sftp.borrow_mut() = Some(sftp.clone());
+                    *this.ssh.borrow_mut() = Some(child);
+                    this.say(&format!("Connected to {}", this.alias));
+                    for then in waiting {
+                        then(&this, sftp.clone());
+                    }
+                }
+                Err(e) => this.say(&format!(
+                    "Could not connect: {e}\nIf this host asks for a password, open a terminal to it first, \
+                     then press Enter in the server path field to retry."
+                )),
+            }
+        });
+    }
+
+    /// Show what went wrong, noting when it was the connection that dropped.
+    fn report(&self, message: String) {
+        self.drop_if_dead();
+        if self.sftp.borrow().is_none() && !self.connecting.get() {
+            self.say(&format!(
+                "{message}\nThe connection was lost; your next action reconnects."
+            ));
+        } else {
+            self.say(&message);
+        }
+    }
+
     /// Show `target` in My Files.
     fn navigate_local(self: &Rc<Self>, target: String) {
         let this = self.clone();
@@ -669,42 +820,25 @@ impl Browser {
 
     /// Show `target` in Server Files, connecting first if needed.
     fn navigate(self: &Rc<Self>, target: String) {
-        if self.closed.get() || self.connecting.get() {
-            return;
-        }
-        self.drop_if_dead();
-        let Some(sftp) = self.sftp.borrow().clone() else {
-            self.say(&format!("Connecting to {}…", self.alias));
-            self.connecting.set(true);
-            let this = self.clone();
-            spawn(connect(ssh::sftp_args(&self.alias)), move |result| {
-                this.connecting.set(false);
-                if this.closed.get() {
-                    // The tab closed meanwhile; dropping the session ends its ssh.
-                    return;
-                }
-                match result {
-                    Ok((sftp, child)) => {
-                        *this.sftp.borrow_mut() = Some(Arc::new(sftp));
-                        *this.ssh.borrow_mut() = Some(child);
-                        this.say(&format!("Connected to {}", this.alias));
-                        this.navigate(target);
+        self.list_remote(target, true);
+    }
+
+    fn list_remote(self: &Rc<Self>, target: String, retry: bool) {
+        self.with_session(move |this, sftp| {
+            let this = this.clone();
+            spawn(list_dir(sftp, target.clone()), move |result| match result {
+                Ok((path, entries)) => this.remote.show(path, entries),
+                Err(e) => {
+                    this.drop_if_dead();
+                    if retry && this.sftp.borrow().is_none() {
+                        // The connection died while idle: reconnect once, quietly.
+                        this.list_remote(target, false);
+                        return;
                     }
-                    Err(e) => this.say(&format!(
-                        "Could not connect: {e}\nIf this host asks for a password, open a terminal to it first, \
-                         then press Enter in the server path field to retry."
-                    )),
+                    this.remote.reset_path();
+                    this.report(format!("Could not open that folder: {e}"));
                 }
             });
-            return;
-        };
-        let this = self.clone();
-        spawn(list_dir(sftp, target), move |result| match result {
-            Ok((path, entries)) => this.remote.show(path, entries),
-            Err(e) => {
-                this.remote.reset_path();
-                this.say(&format!("Could not open that folder: {e}"));
-            }
         });
     }
 
@@ -715,19 +849,18 @@ impl Browser {
 
     /// A server symlink: open it if it leads to a folder, otherwise download it.
     fn open_link(self: &Rc<Self>, entry: Entry) {
-        let Some(sftp) = self.sftp.borrow().clone() else {
-            return;
-        };
-        let this = self.clone();
-        let path = entry.path.clone();
-        spawn(
-            async move { Ok(sftp.metadata(path).await?.is_dir()) },
-            move |result| match result {
-                Ok(true) => this.navigate(entry.path),
-                Ok(false) => this.download(vec![entry]),
-                Err(e) => this.say(&format!("Could not open {}: {e}", entry.name)),
-            },
-        );
+        self.with_session(move |this, sftp| {
+            let this = this.clone();
+            let path = entry.path.clone();
+            spawn(
+                async move { Ok(sftp.metadata(path).await?.is_dir()) },
+                move |result| match result {
+                    Ok(true) => this.navigate(entry.path),
+                    Ok(false) => this.download(vec![entry]),
+                    Err(e) => this.report(format!("Could not open {}: {e}", entry.name)),
+                },
+            );
+        });
     }
 
     fn context_menu(self: &Rc<Self>, server: bool, x: f64, y: f64) {
@@ -768,24 +901,25 @@ impl Browser {
             self.say("Folders can't be downloaded yet; open one and pick its files.");
             return;
         }
-        let Some(sftp) = self.sftp.borrow().clone() else {
-            self.say("Not connected.");
-            return;
-        };
         let folder = PathBuf::from(self.local.cwd.borrow().clone());
-        for e in files {
-            let local = free_local_path(&folder, &e.name);
-            self.say(&format!("Downloading {}…", e.name));
-            let this = self.clone();
-            let shown = local.display().to_string();
-            spawn(download(sftp.clone(), e.path, local), move |result| {
-                match result {
-                    Ok(()) => this.say(&format!("Saved {shown}")),
-                    Err(err) => this.say(&format!("Download of {} failed: {err}", e.name)),
-                }
-                this.refresh_local();
-            });
-        }
+        self.with_session(move |this, sftp| {
+            for e in files {
+                let local = free_local_path(&folder, &e.name);
+                this.say(&format!("Downloading {}…", e.name));
+                let count = this.transfer_started(false, e.size);
+                let this = this.clone();
+                let shown = local.display().to_string();
+                let work = download(sftp.clone(), e.path, local, count.clone());
+                spawn(work, move |result| {
+                    this.transfer_finished(false, &count);
+                    match result {
+                        Ok(()) => this.say(&format!("Saved {shown}")),
+                        Err(err) => this.report(format!("Download of {} failed: {err}", e.name)),
+                    }
+                    this.refresh_local();
+                });
+            }
+        });
     }
 
     /// Copy files selected in My Files to the folder shown in Server Files.
@@ -807,10 +941,7 @@ impl Browser {
     }
 
     fn upload_files(self: &Rc<Self>, paths: Vec<PathBuf>) {
-        let Some(sftp) = self.sftp.borrow().clone() else {
-            self.say("Not connected.");
-            return;
-        };
+        let mut files = Vec::new();
         for local in paths {
             let Some(name) = local
                 .file_name()
@@ -826,20 +957,151 @@ impl Browser {
                 ));
                 continue;
             }
-            let remote = join(&self.remote.cwd.borrow(), &name);
-            self.say(&format!("Uploading {name}…"));
-            let this = self.clone();
-            spawn(
-                upload(sftp.clone(), local, remote),
-                move |result| match result {
-                    Ok(()) => {
-                        this.refresh();
-                        this.say(&format!("Uploaded {name}"));
-                    }
-                    Err(e) => this.say(&format!("Upload of {name} failed: {e}")),
-                },
-            );
+            files.push((local, name));
         }
+        if files.is_empty() {
+            return;
+        }
+        let folder = self.remote.cwd.borrow().clone();
+        self.with_session(move |this, sftp| {
+            for (local, name) in files {
+                let remote = join(&folder, &name);
+                this.say(&format!("Uploading {name}…"));
+                let size = std::fs::metadata(&local).map_or(0, |m| m.len());
+                let count = this.transfer_started(true, size);
+                let this = this.clone();
+                let work = upload(sftp.clone(), local, remote, count.clone());
+                spawn(work, move |result| {
+                    this.transfer_finished(true, &count);
+                    match result {
+                        Ok(()) => {
+                            this.refresh();
+                            this.say(&format!("Uploaded {name}"));
+                        }
+                        Err(e) => this.report(format!("Upload of {name} failed: {e}")),
+                    }
+                });
+            }
+        });
+    }
+
+    /// Count a new transfer of `size` bytes into the progress bar; returns
+    /// the counter the transfer adds its bytes to.
+    fn transfer_started(self: &Rc<Self>, upload: bool, size: u64) -> Arc<AtomicU64> {
+        let progress = &self.progress;
+        let count = Arc::new(AtomicU64::new(0));
+        if progress.items.borrow().is_empty() {
+            progress.last.set((Instant::now(), 0));
+            progress.speed.set(0.0);
+        }
+        progress.items.borrow_mut().push((count.clone(), size));
+        let kind = if upload {
+            &progress.uploads
+        } else {
+            &progress.downloads
+        };
+        kind.set(kind.get() + 1);
+        progress.bar.set_visible(true);
+        if progress.timer.borrow().is_none() {
+            let this = Rc::downgrade(self);
+            let timer =
+                glib::timeout_add_local(Duration::from_millis(200), move || match this.upgrade() {
+                    Some(this) => {
+                        this.show_progress();
+                        glib::ControlFlow::Continue
+                    }
+                    None => glib::ControlFlow::Break,
+                });
+            *progress.timer.borrow_mut() = Some(timer);
+        }
+        self.show_progress();
+        count
+    }
+
+    /// A transfer ended (done or failed): it counts as complete in the bar.
+    fn transfer_finished(self: &Rc<Self>, upload: bool, count: &Arc<AtomicU64>) {
+        let progress = &self.progress;
+        if let Some((count, size)) = progress
+            .items
+            .borrow()
+            .iter()
+            .find(|(c, _)| Arc::ptr_eq(c, count))
+        {
+            count.fetch_max(*size, Ordering::Relaxed);
+        }
+        let kind = if upload {
+            &progress.uploads
+        } else {
+            &progress.downloads
+        };
+        kind.set(kind.get().saturating_sub(1));
+        self.show_progress();
+        if progress.uploads.get() + progress.downloads.get() > 0 {
+            return;
+        }
+        if let Some(timer) = progress.timer.take() {
+            timer.remove();
+        }
+        // Leave the full bar up a moment, unless new transfers start.
+        let this = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+            if let Some(this) = this.upgrade()
+                && this.progress.uploads.get() + this.progress.downloads.get() == 0
+            {
+                this.progress.items.borrow_mut().clear();
+                this.progress.bar.set_visible(false);
+            }
+        });
+    }
+
+    fn show_progress(&self) {
+        let progress = &self.progress;
+        let (done, total) =
+            progress
+                .items
+                .borrow()
+                .iter()
+                .fold((0, 0), |(done, total), (count, size)| {
+                    let moved = count.load(Ordering::Relaxed);
+                    // A file can grow while it is copied.
+                    (done + moved, total + moved.max(*size))
+                });
+        let (then, done_then) = progress.last.get();
+        let seconds = then.elapsed().as_secs_f64();
+        if seconds >= 0.5 {
+            let now = (done - done_then.min(done)) as f64 / seconds;
+            // Smooth it, so the number is readable.
+            let speed = match progress.speed.get() {
+                0.0 => now,
+                old => old * 0.6 + now * 0.4,
+            };
+            progress.speed.set(speed);
+            progress.last.set((Instant::now(), done));
+        }
+        let (up, down) = (progress.uploads.get(), progress.downloads.get());
+        let files = |n: usize| {
+            if n == 1 {
+                "1 file".to_owned()
+            } else {
+                format!("{n} files")
+            }
+        };
+        let what = match (up, down) {
+            (0, 0) => "Done".to_owned(),
+            (up, 0) => format!("Uploading {}", files(up)),
+            (0, down) => format!("Downloading {}", files(down)),
+            (up, down) => format!("Transferring {}", files(up + down)),
+        };
+        let mut text = format!("{what} · {} of {}", human_size(done), human_size(total));
+        if up + down > 0 && progress.speed.get() > 0.0 {
+            text += &format!(" · {}/s", human_size(progress.speed.get() as u64));
+        }
+        progress.bar.set_text(Some(&text));
+        progress.bar.set_fraction(if total == 0 {
+            1.0
+        } else {
+            done as f64 / total as f64
+        });
     }
 
     fn ask_new_folder(self: &Rc<Self>) {
@@ -849,18 +1111,17 @@ impl Browser {
                 this.say("That name can't be used.");
                 return;
             }
-            let Some(sftp) = this.sftp.borrow().clone() else {
-                return;
-            };
             let path = join(&this.remote.cwd.borrow(), &name);
-            let this = this.clone();
-            spawn(
-                async move { Ok(sftp.create_dir(path).await?) },
-                move |result| match result {
-                    Ok(()) => this.refresh(),
-                    Err(e) => this.say(&format!("Could not create {name}: {e}")),
-                },
-            );
+            this.with_session(move |this, sftp| {
+                let this = this.clone();
+                spawn(
+                    async move { Ok(sftp.create_dir(path).await?) },
+                    move |result| match result {
+                        Ok(()) => this.refresh(),
+                        Err(e) => this.report(format!("Could not create {name}: {e}")),
+                    },
+                );
+            });
         });
     }
 
@@ -880,19 +1141,18 @@ impl Browser {
                     this.say("That name can't be used.");
                     return;
                 }
-                let Some(sftp) = this.sftp.borrow().clone() else {
-                    return;
-                };
                 let from = entry.path.clone();
                 let to = join(&parent(&from), &name);
-                let this = this.clone();
-                spawn(
-                    async move { Ok(sftp.rename(from, to).await?) },
-                    move |result| match result {
-                        Ok(()) => this.refresh(),
-                        Err(e) => this.say(&format!("Rename failed: {e}")),
-                    },
-                );
+                this.with_session(move |this, sftp| {
+                    let this = this.clone();
+                    spawn(
+                        async move { Ok(sftp.rename(from, to).await?) },
+                        move |result| match result {
+                            Ok(()) => this.refresh(),
+                            Err(e) => this.report(format!("Rename failed: {e}")),
+                        },
+                    );
+                });
             },
         );
     }
@@ -912,29 +1172,28 @@ impl Browser {
         };
         let this = self.clone();
         dialogs::confirm(&self.app, &heading, body, "Delete", move || {
-            let Some(sftp) = this.sftp.borrow().clone() else {
-                return;
-            };
             let work = targets
                 .iter()
                 .map(|e| (e.path.clone(), e.dir && !e.link))
                 .collect::<Vec<_>>();
-            this.say("Deleting…");
-            let this = this.clone();
-            spawn(
-                async move {
-                    for (path, dir) in work {
-                        remove_all(sftp.clone(), path, dir).await?;
-                    }
-                    Ok(())
-                },
-                move |result| {
-                    this.refresh();
-                    if let Err(e) = result {
-                        this.say(&format!("Delete failed: {e}"));
-                    }
-                },
-            );
+            this.with_session(move |this, sftp| {
+                this.say("Deleting…");
+                let this = this.clone();
+                spawn(
+                    async move {
+                        for (path, dir) in work {
+                            remove_all(sftp.clone(), path, dir).await?;
+                        }
+                        Ok(())
+                    },
+                    move |result| {
+                        this.refresh();
+                        if let Err(e) = result {
+                            this.report(format!("Delete failed: {e}"));
+                        }
+                    },
+                );
+            });
         });
     }
 }
@@ -1029,13 +1288,23 @@ mod live_tests {
             sftp.create_dir(dir.clone()).await.unwrap();
             sftp.create_dir(join(&dir, "nested")).await.unwrap();
 
-            upload(sftp.clone(), local.join("up.bin"), join(&dir, "a.bin"))
-                .await
-                .unwrap();
+            upload(
+                sftp.clone(),
+                local.join("up.bin"),
+                join(&dir, "a.bin"),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
             assert!(
-                upload(sftp.clone(), local.join("up.bin"), join(&dir, "a.bin"))
-                    .await
-                    .is_err(),
+                upload(
+                    sftp.clone(),
+                    local.join("up.bin"),
+                    join(&dir, "a.bin"),
+                    Arc::default()
+                )
+                .await
+                .is_err(),
                 "no overwrite"
             );
             sftp.rename(join(&dir, "a.bin"), join(&dir, "b.bin"))
@@ -1047,13 +1316,104 @@ mod live_tests {
             assert_eq!(names, [("nested", true), ("b.bin", false)]);
             assert_eq!(entries[1].size, payload.len() as u64);
 
-            download(sftp.clone(), join(&dir, "b.bin"), local.join("down.bin"))
-                .await
-                .unwrap();
+            download(
+                sftp.clone(),
+                join(&dir, "b.bin"),
+                local.join("down.bin"),
+                Arc::default(),
+            )
+            .await
+            .unwrap();
             assert_eq!(std::fs::read(local.join("down.bin")).unwrap(), payload);
 
             remove_all(sftp.clone(), dir.clone(), true).await.unwrap();
             assert!(sftp.metadata(dir).await.is_err(), "removed");
+        });
+        std::fs::remove_dir_all(local).unwrap();
+    }
+}
+
+/// Transfer speed, tuned vs. library defaults with 8 KB copies (as before).
+/// `SSHPILOT_RS_TEST_HOST=alias SSHPILOT_RS_TEST_SSH_CONFIG=config cargo test --release -- --ignored --nocapture sftp_speed`
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "needs an SSH server"]
+    fn sftp_speed() {
+        let host = std::env::var("SSHPILOT_RS_TEST_HOST").expect("SSHPILOT_RS_TEST_HOST");
+        let mut args = ssh::sftp_args(&host);
+        if let Ok(config) = std::env::var("SSHPILOT_RS_TEST_SSH_CONFIG") {
+            args.splice(1..1, ["-F".to_owned(), config]);
+        }
+        let local = std::env::temp_dir().join(format!("sshpilot-rs-speed-{}", std::process::id()));
+        std::fs::create_dir_all(&local).unwrap();
+        let size = 32 * 1024 * 1024;
+        let payload: Vec<u8> = (0..size as u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(local.join("up.bin"), &payload).unwrap();
+        let mb = size as f64 / 1e6;
+
+        crate::runtime().block_on(async {
+            let (tuned, _a) = connect(args.clone()).await.unwrap();
+            let tuned = Arc::new(tuned);
+            let (old, _b) = connect_with(args.clone(), Default::default())
+                .await
+                .unwrap();
+            let (home, _) = list_dir(tuned.clone(), ".".into()).await.unwrap();
+            let remote = join(&home, "sshpilot-rs-speed.bin");
+            // Alternate which goes first, so caches and warm-up favour neither.
+            for round in 0..4 {
+                for tuned_turn in [round % 2 == 0, round % 2 != 0] {
+                    let _ = tuned.remove_file(remote.clone()).await;
+                    let _ = std::fs::remove_file(local.join("down.bin"));
+                    let t = Instant::now();
+                    if tuned_turn {
+                        upload(
+                            tuned.clone(),
+                            local.join("up.bin"),
+                            remote.clone(),
+                            Arc::default(),
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        let mut source = tokio::fs::File::open(local.join("up.bin")).await.unwrap();
+                        let mut target = old.create(remote.clone()).await.unwrap();
+                        tokio::io::copy(&mut source, &mut target).await.unwrap();
+                        target.shutdown().await.unwrap();
+                    }
+                    let up = t.elapsed().as_secs_f64();
+                    let t = Instant::now();
+                    if tuned_turn {
+                        download(
+                            tuned.clone(),
+                            remote.clone(),
+                            local.join("down.bin"),
+                            Arc::default(),
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        let mut source = old.open(remote.clone()).await.unwrap();
+                        let mut target = tokio::fs::File::create(local.join("down.bin"))
+                            .await
+                            .unwrap();
+                        tokio::io::copy(&mut source, &mut target).await.unwrap();
+                        target.flush().await.unwrap();
+                    }
+                    let down = t.elapsed().as_secs_f64();
+                    assert_eq!(std::fs::read(local.join("down.bin")).unwrap(), payload);
+                    eprintln!(
+                        "round {round} {}: upload {:6.1} MB/s, download {:6.1} MB/s",
+                        if tuned_turn { "tuned " } else { "before" },
+                        mb / up,
+                        mb / down
+                    );
+                }
+            }
+            tuned.remove_file(remote).await.unwrap();
         });
         std::fs::remove_dir_all(local).unwrap();
     }
