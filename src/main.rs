@@ -262,6 +262,62 @@ fn tab_menu(app: &Rc<App>) {
     }
 }
 
+/// The title-bar button layout (`icon:minimize,maximize,close`: start side,
+/// then end side) without the window icon, if the icon is on the start side;
+/// `None` if it is not there.
+fn without_start_icon(layout: &str) -> Option<String> {
+    let (start, end) = layout.split_once(':').unwrap_or((layout, ""));
+    let items: Vec<&str> = start.split(',').filter(|item| !item.is_empty()).collect();
+    if !items.contains(&"icon") {
+        return None;
+    }
+    let rest: Vec<&str> = items.into_iter().filter(|item| *item != "icon").collect();
+    Some(format!("{}:{end}", rest.join(",")))
+}
+
+/// A button showing the app icon that opens a local terminal.
+fn corner_button() -> gtk::Button {
+    let image = gtk::Image::from_icon_name(APP_ID);
+    image.set_pixel_size(20);
+    gtk::Button::builder()
+        .child(&image)
+        .tooltip_text("New Local Terminal (Ctrl+Shift+T)")
+        .action_name("win.local-terminal")
+        .css_classes(["flat"])
+        .build()
+}
+
+/// Where the window icon would be drawn, and the corner buttons replacing it.
+#[derive(Clone)]
+struct Corners {
+    split: adw::OverlaySplitView,
+    sidebar_header: adw::HeaderBar,
+    start_controls: gtk::WindowControls,
+    corner: gtk::Button,
+    content_corner: gtk::Button,
+}
+
+impl Corners {
+    /// If the desktop puts the window icon in the top-left corner, show the
+    /// app's own corner button there instead (in whichever header is on the
+    /// left); otherwise leave the title buttons as they are.
+    fn refresh(&self) {
+        let layout = gtk::Settings::default()
+            .and_then(|settings| settings.gtk_decoration_layout())
+            .map(|layout| layout.to_string())
+            .unwrap_or_default();
+        let stripped = without_start_icon(&layout);
+        // `None` lets them follow the desktop's layout again.
+        self.sidebar_header
+            .set_decoration_layout(stripped.as_deref());
+        self.start_controls
+            .set_decoration_layout(stripped.as_deref());
+        self.corner.set_visible(stripped.is_some());
+        self.content_corner
+            .set_visible(stripped.is_some() && !self.split.shows_sidebar());
+    }
+}
+
 fn build(application: &adw::Application) {
     // One window: a second launch only raises it (two would overwrite each
     // other's layout file).
@@ -316,6 +372,10 @@ fn build(application: &adw::Application) {
         .build();
     let sidebar_header = adw::HeaderBar::new();
     sidebar_header.set_title_widget(Some(&adw::WindowTitle::new("SSH Pilot RS", "")));
+    // The app icon in the top-left corner opens a local terminal (it takes
+    // the place of the window icon; see `refresh_corner`).
+    let corner = corner_button();
+    sidebar_header.pack_start(&corner);
     sidebar_header.pack_start(&add_button);
     let hide_sidebar = gtk::Button::builder()
         .icon_name("pan-start-symbolic")
@@ -392,6 +452,9 @@ fn build(application: &adw::Application) {
     header_row.add_css_class("toolbar");
     header_row.set_size_request(-1, 46);
     header_row.append(&start_controls);
+    // The same corner button, for when the connections panel is folded away.
+    let content_corner = corner_button();
+    header_row.append(&content_corner);
     header_row.append(&show_sidebar);
     header_row.append(&tab_bar);
     header_row.append(&font_button);
@@ -424,17 +487,32 @@ fn build(application: &adw::Application) {
     split.set_show_sidebar(!sidebar_hidden);
     show_sidebar.set_visible(sidebar_hidden);
     start_controls.set_visible(sidebar_hidden);
+    let corners = Corners {
+        split: split.clone(),
+        sidebar_header: sidebar_header.clone(),
+        start_controls: start_controls.clone(),
+        corner,
+        content_corner,
+    };
+    corners.refresh();
     // With the panel shown, its own header has the start-side window buttons.
     split.connect_show_sidebar_notify(glib::clone!(
         #[weak]
         show_sidebar,
         #[weak]
         start_controls,
+        #[strong]
+        corners,
         move |split| {
             show_sidebar.set_visible(!split.shows_sidebar());
             start_controls.set_visible(!split.shows_sidebar());
+            corners.refresh();
         }
     ));
+    // Follow changes to the title-bar button layout while running.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.connect_gtk_decoration_layout_notify(move |_| corners.refresh());
+    }
 
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&split));
@@ -586,4 +664,26 @@ fn main() -> glib::ExitCode {
     });
     application.connect_activate(build);
     application.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn takes_the_window_icon_out_of_the_start_side() {
+        assert_eq!(
+            without_start_icon("icon:minimize,maximize,close").as_deref(),
+            Some(":minimize,maximize,close")
+        );
+        assert_eq!(
+            without_start_icon("close,icon:menu").as_deref(),
+            Some("close:menu")
+        );
+        assert_eq!(without_start_icon("icon").as_deref(), Some(":"));
+        // No icon, or the icon on the end side: left alone.
+        assert_eq!(without_start_icon(":minimize,maximize,close"), None);
+        assert_eq!(without_start_icon("close:icon"), None);
+        assert_eq!(without_start_icon(""), None);
+    }
 }

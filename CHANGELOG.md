@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Clicking the app icon in the top-left corner opens a new local terminal (when your desktop shows the window icon there, as KDE does by default).
+
 ## 0.2.1
 
 - Starts maximized; <kbd>F11</kbd> switches full screen on and off.
