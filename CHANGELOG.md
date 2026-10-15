@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A tab closes when its session ends (`exit`, <kbd>Ctrl</kbd>+<kbd>D</kbd>). If `ssh` itself fails (can't connect, login refused, connection lost), the tab stays open with the error.
+- Duplicating a local terminal starts the copy in the folder the original is in (any shell, no setup).
+
 ## 0.2.2
 
 - Clicking the app icon in the top-left corner opens a new local terminal (when your desktop shows the window icon there, as KDE does by default).

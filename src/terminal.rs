@@ -1,7 +1,7 @@
 //! Terminal tabs: the system `ssh` to a host, or a local shell.
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -26,11 +26,17 @@ pub fn open(app: &Rc<App>, alias: &str) {
 
 /// A terminal running the user's shell in their home folder.
 pub fn open_local(app: &Rc<App>) {
+    open_local_in(app, None);
+}
+
+/// A terminal running the user's shell in `dir`, else the home folder.
+pub fn open_local_in(app: &Rc<App>, dir: Option<PathBuf>) {
     let home = store::home_dir();
+    let dir = dir.filter(|dir| dir.to_str().is_some()).unwrap_or(home);
     let page = add_tab(
         app,
         &[user_shell()],
-        home.to_str(),
+        dir.to_str(),
         "",
         "Local",
         "computer-symbolic",
@@ -79,6 +85,31 @@ fn login_shell() -> Option<String> {
     line.trim_end().rsplit(':').next().map(str::to_owned)
 }
 
+/// The folder the local shell in `page` is in now, read from the system
+/// (works in any shell, no setup), if that folder still exists.
+pub fn working_dir(app: &App, page: &adw::TabPage) -> Option<PathBuf> {
+    let terminal = terminal_in(page)?;
+    let pid = app
+        .local_shells
+        .borrow()
+        .iter()
+        .find(|(shell, _)| shell.upgrade().as_ref() == Some(&terminal))
+        .map(|(_, pid)| *pid)?;
+    // A folder deleted since reads as "/path (deleted)", which is not a folder.
+    let dir = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    dir.is_dir().then_some(dir)
+}
+
+/// Whether an ssh tab whose `ssh` ended with wait `status` closes by itself:
+/// yes when the remote session ended (`exit`, Ctrl+D, with whatever exit code
+/// the remote shell passes back), no when ssh itself failed (255: could not
+/// connect, login refused, connection lost) or was killed, so the error
+/// stays readable.
+fn ssh_session_finished(status: i32) -> bool {
+    let exited = status & 0x7f == 0;
+    exited && (status >> 8) & 0xff != 255
+}
+
 fn pick_shell(
     candidates: impl IntoIterator<Item = Option<String>>,
     usable: impl Fn(&Path) -> bool,
@@ -117,6 +148,8 @@ fn add_tab(
 
     let program = argv[0].clone();
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let local = host.is_empty();
+    let weak_app = Rc::downgrade(app);
     terminal.spawn_async(
         vte4::PtyFlags::DEFAULT,
         dir,
@@ -129,16 +162,22 @@ fn add_tab(
         glib::clone!(
             #[weak]
             terminal,
-            move |result| {
-                if let Err(e) = result {
+            move |result| match result {
+                // Remember a local shell, so Duplicate can start in its folder.
+                Ok(pid) if local => {
+                    if let Some(app) = weak_app.upgrade() {
+                        let mut shells = app.local_shells.borrow_mut();
+                        shells.retain(|(shell, _)| shell.upgrade().is_some());
+                        shells.push((terminal.downgrade(), pid.0));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
                     terminal.feed(format!("Could not start {program}: {e}\r\n").as_bytes());
                 }
             }
         ),
     );
-    terminal.connect_child_exited(|terminal, _status| {
-        terminal.feed(b"\r\n[Session ended]\r\n");
-    });
 
     // A rounded black card with a scrollbar, as in sshPilot.
     let scroller = gtk::ScrolledWindow::builder()
@@ -159,6 +198,35 @@ fn add_tab(
     page.set_icon(Some(&gio::ThemedIcon::new(icon)));
     app.tabs.set_selected_page(&page);
     terminal.grab_focus();
+
+    // When the session ends, close the tab, unless ssh failed: then its
+    // error stays on screen.
+    let weak_app = Rc::downgrade(app);
+    terminal.connect_child_exited(glib::clone!(
+        #[weak]
+        page,
+        move |terminal, status| {
+            let Some(app) = weak_app.upgrade() else {
+                return;
+            };
+            app.local_shells
+                .borrow_mut()
+                .retain(|(shell, _)| shell.upgrade().is_some_and(|shell| &shell != terminal));
+            if !local && !ssh_session_finished(status) {
+                terminal.feed(
+                    b"\r\n[ssh stopped with the error above. Close this tab, or duplicate it to try again.]\r\n",
+                );
+                return;
+            }
+            // After the signal, not inside it: closing destroys this terminal.
+            glib::idle_add_local_once(move || {
+                let open = (0..app.tabs.n_pages()).any(|i| app.tabs.nth_page(i) == page);
+                if open {
+                    app.tabs.close_page(&page);
+                }
+            });
+        }
+    ));
     page
 }
 
@@ -388,6 +456,16 @@ fn add_shortcuts(terminal: &vte4::Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_tabs_close_unless_ssh_failed() {
+        // Wait statuses: exit code in the second byte, signal in the low bits.
+        assert!(ssh_session_finished(0), "exit");
+        assert!(ssh_session_finished(1 << 8), "exit after a failed command");
+        assert!(ssh_session_finished(130 << 8), "remote shell's own code");
+        assert!(!ssh_session_finished(255 << 8), "ssh error");
+        assert!(!ssh_session_finished(9), "killed");
+    }
 
     #[test]
     fn picks_the_first_usable_shell() {

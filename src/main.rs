@@ -72,6 +72,8 @@ pub struct App {
     watched: RefCell<(Vec<PathBuf>, Vec<gio::FileMonitor>)>,
     /// Hosts a tab was opened to, whose shared connection to close on quit.
     pub connected: RefCell<BTreeSet<String>>,
+    /// Local terminals and the process ID of their shell.
+    pub local_shells: RefCell<Vec<(glib::WeakRef<vte4::Terminal>, i32)>>,
     pub window: adw::ApplicationWindow,
     pub list: gtk::ListBox,
     pub rows: RefCell<Vec<sidebar::RowKind>>,
@@ -219,7 +221,8 @@ fn tab_menu(app: &Rc<App>) {
             if terminal::terminal_in(&page).is_none() {
                 files::open(&app, &host);
             } else if host.is_empty() {
-                terminal::open_local(&app);
+                // In the folder the original is in now.
+                terminal::open_local_in(&app, terminal::working_dir(&app, &page));
             } else {
                 terminal::open(&app, &host);
             }
@@ -525,6 +528,7 @@ fn build(application: &adw::Application) {
         config_path: store::ssh_config_path(),
         watched: RefCell::default(),
         connected: RefCell::default(),
+        local_shells: RefCell::default(),
         window: window.clone(),
         list,
         rows: RefCell::new(Vec::new()),
