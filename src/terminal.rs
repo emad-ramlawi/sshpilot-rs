@@ -1,6 +1,6 @@
 //! Terminal tabs: the system `ssh` to a host, or a local shell.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -74,7 +74,7 @@ fn user_shell() -> String {
 /// The shell field of this user's `passwd` entry (also for LDAP or
 /// systemd-homed users, through `getent`).
 fn login_shell() -> Option<String> {
-    let uid = std::fs::metadata("/proc/self").ok()?.uid();
+    let uid = store::my_uid()?;
     let output = std::process::Command::new("getent")
         .args(["passwd", &uid.to_string()])
         .stderr(std::process::Stdio::null())

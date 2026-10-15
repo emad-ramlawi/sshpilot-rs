@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**Faster**
+- Large configs: with 10,000 hosts, reloading `~/.ssh/config` and redrawing the sidebar takes about 0.4–0.5 s instead of 1.1–1.6 s (host lookups, duplicate checks and layout matching no longer rescan every host). No difference you'd notice at a few hundred hosts.
+- Folder listings sort about 4–5× faster (31 → 7 ms for 20,000 files).
+
+**Security**
+- The private runtime folder (connection-sharing sockets, icon copies) is used only if `$XDG_RUNTIME_DIR` is really private: owned by you, `0700`, not a symlink. Before, a shared one such as `/tmp` let another user plant a symlink the app would follow, or a fake ssh control socket.
+- Release workflow: actions pinned to exact commits; only the publish job can write to the repository.
+
 ## 0.2.3
 
 - A tab closes when its session ends (`exit`, <kbd>Ctrl</kbd>+<kbd>D</kbd>). If `ssh` itself fails (can't connect, login refused, connection lost), the tab stays open with the error.

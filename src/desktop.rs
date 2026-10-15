@@ -78,16 +78,14 @@ fn entry_for(program: &str) -> Result<String> {
 }
 
 /// Let the app find its own icons even before `--install` (headers, dialogs):
-/// a copy goes in a private folder under `$XDG_RUNTIME_DIR` (memory, cleared
-/// at logout) that is added to the icon theme's search path.
+/// a copy goes in the app's private folder under `$XDG_RUNTIME_DIR` (memory,
+/// cleared at logout; see `store::runtime_dir`) that is added to the icon
+/// theme's search path.
 pub fn provide_icon() {
-    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
+    let Some(runtime) = store::runtime_dir() else {
         return;
     };
-    if !runtime.is_absolute() {
-        return;
-    }
-    let icons = runtime.join("sshpilot-rs").join("icons");
+    let icons = runtime.join("icons");
     let apps = icons.join("hicolor/scalable/apps");
     let written = fs::create_dir_all(&apps)
         .and_then(|()| fs::write(apps.join(format!("{APP_ID}.svg")), ICON))

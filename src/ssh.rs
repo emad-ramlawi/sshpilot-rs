@@ -12,25 +12,12 @@
 //! away when it quits (`exit_args`). Keep-alives keep idle sessions through
 //! NAT/firewall timeouts and notice a dead link within about two minutes.
 
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 
-/// Private folder for the multiplexing sockets, or `None` without a
+/// Private folder for the multiplexing sockets, or `None` without a safe
 /// per-user runtime dir (sharing is then skipped rather than put in /tmp).
 fn control_dir() -> Option<PathBuf> {
-    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
-    if !runtime.is_absolute() {
-        return None;
-    }
-    let dir = runtime.join("sshpilot-rs");
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .recursive(true)
-        .create(&dir)
-        .ok()?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
-    Some(dir)
+    crate::store::runtime_dir()
 }
 
 fn base_args() -> Vec<String> {

@@ -2,9 +2,10 @@
 //! them (groups and the manual order: the order of the vectors) and a few
 //! view settings (terminal font and text size, the folded panel).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +41,48 @@ pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// This process's (effective) user ID: the owner of its `/proc` entry.
+pub fn my_uid() -> Option<u32> {
+    fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+/// A real folder (not a symlink) owned by `uid` that nobody else can use.
+fn private_folder(path: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o077 == 0)
+}
+
+/// This app's private folder in the runtime dir (`$XDG_RUNTIME_DIR/sshpilot-rs`),
+/// for the ssh connection-sharing sockets and the icon copies; `None` when
+/// there is no safe one, and those are skipped.
+pub fn runtime_dir() -> Option<PathBuf> {
+    app_dir_in(
+        &PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?),
+        my_uid()?,
+    )
+}
+
+/// The runtime dir must be what the XDG spec promises: a real folder of
+/// ours that no one else can enter. A shared one (say `XDG_RUNTIME_DIR=/tmp`)
+/// would let another user plant a symlink, or a fake ssh control socket that
+/// captures a session. Inside a private one, nobody else can change ours.
+fn app_dir_in(runtime: &Path, uid: u32) -> Option<PathBuf> {
+    if !runtime.is_absolute() || !private_folder(runtime, uid) {
+        return None;
+    }
+    let dir = runtime.join("sshpilot-rs");
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return None,
+        _ => {}
+    }
+    let ours = fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid);
+    if !ours {
+        return None;
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
 }
 
 pub fn ssh_config_path() -> PathBuf {
@@ -89,6 +132,8 @@ pub fn parse_ssh_config(text: &str) -> Vec<Host> {
 #[derive(Default)]
 struct Parser {
     hosts: Vec<Host>,
+    /// The aliases in `hosts`, to skip repeats without scanning it.
+    aliases: HashSet<String>,
     /// Indexes into `hosts` that the current block applies to.
     current: Vec<usize>,
     /// Where relative `Include` paths start (`None`: ignore `Include`).
@@ -133,7 +178,7 @@ impl Parser {
                 "host" => {
                     self.current.clear();
                     for alias in value.split_whitespace() {
-                        if !usable_alias(alias) || self.hosts.iter().any(|h| h.alias == alias) {
+                        if !usable_alias(alias) || !self.aliases.insert(alias.to_owned()) {
                             continue;
                         }
                         self.current.push(self.hosts.len());
@@ -385,20 +430,26 @@ impl Layout {
     /// ungrouped list, aliases no longer in the config are dropped.
     /// Returns whether anything changed.
     pub fn reconcile(&mut self, hosts: &[Host]) -> bool {
-        let before = self.clone();
-        let present = |alias: &String| hosts.iter().any(|h| &h.alias == alias);
-        let mut seen = std::collections::HashSet::new();
-        self.ungrouped
-            .retain(|a| present(a) && seen.insert(a.clone()));
+        let present: HashSet<&str> = hosts.iter().map(|h| h.alias.as_str()).collect();
+        let mut seen = HashSet::new();
+        let mut changed = false;
+        // Keep the first placement of each alias still in the config.
+        let mut keep = |alias: &String| {
+            let kept = present.contains(alias.as_str()) && seen.insert(alias.clone());
+            changed |= !kept;
+            kept
+        };
+        self.ungrouped.retain(|a| keep(a));
         for group in &mut self.groups {
-            group.hosts.retain(|a| present(a) && seen.insert(a.clone()));
+            group.hosts.retain(|a| keep(a));
         }
         for host in hosts {
             if !seen.contains(&host.alias) {
                 self.ungrouped.push(host.alias.clone());
+                changed = true;
             }
         }
-        *self != before
+        changed
     }
 
     /// Place `alias` at `index` of `group` (an index into the list as it is
@@ -570,6 +621,80 @@ mod tests {
             2
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_alias_keeps_its_first_block() {
+        let text = "Host a b\n  User one\nHost b c a\n  User two\n";
+        let parsed = parse_ssh_config(text);
+        let shown: Vec<_> = parsed
+            .iter()
+            .map(|h| (h.alias.as_str(), h.target()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("a", "one@a".into()),
+                ("b", "one@b".into()),
+                ("c", "two@c".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_every_change() {
+        let (l, g) = sample();
+        let all = hosts(&["a", "b", "c", "d"]);
+        assert!(!l.clone().reconcile(&all), "nothing to do");
+        // An alias placed twice (hand-edited file): the first placement stays.
+        let mut twice = l.clone();
+        twice.group_mut(g).unwrap().hosts.push("a".into());
+        assert!(twice.reconcile(&all));
+        assert_eq!(twice, l);
+        let mut gone = l.clone();
+        assert!(
+            gone.reconcile(&hosts(&["a", "b", "c"])),
+            "removed from config"
+        );
+        let mut new = l.clone();
+        assert!(
+            new.reconcile(&hosts(&["a", "b", "c", "d", "e"])),
+            "added to config"
+        );
+        assert_eq!(new.ungrouped, ["a", "b", "c", "e"]);
+    }
+
+    #[test]
+    fn uses_only_a_private_runtime_dir() {
+        let base = std::env::temp_dir().join(format!("sshpilot-rs-rt-{}", std::process::id()));
+        let uid = my_uid().unwrap();
+        let (private, shared, victim) = (
+            base.join("private"),
+            base.join("shared"),
+            base.join("victim"),
+        );
+        for dir in [&private, &shared, &victim] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let dir = app_dir_in(&private, uid).expect("private runtime dir");
+        assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(app_dir_in(&private, uid), Some(dir), "again");
+        assert_eq!(app_dir_in(&shared, uid), None, "shared, like /tmp");
+        assert_eq!(app_dir_in(&private, uid + 1), None, "someone else's");
+        assert_eq!(app_dir_in(Path::new("relative"), uid), None);
+
+        // A planted symlink is refused, and its target left alone.
+        fs::remove_dir(private.join("sshpilot-rs")).unwrap();
+        std::os::unix::fs::symlink(&victim, private.join("sshpilot-rs")).unwrap();
+        assert_eq!(app_dir_in(&private, uid), None);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        assert_eq!(app_dir_in(&link, uid), None, "runtime dir itself a symlink");
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

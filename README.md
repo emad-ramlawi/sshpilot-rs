@@ -80,7 +80,7 @@ What Rust brings here:
 - **Memory safety without a garbage collector.** Buffer overflows, use-after-free and data races, the bug classes behind most security advisories in C/C++ code, are ruled out at compile time in this codebase.
 - **One small native binary.** About 1.3 MB, with no Python interpreter or pip packages to install. Put it anywhere and run it.
 - **Fast and light.** No interpreter startup and no daemon of its own. SSH and SFTP run on a small async runtime (Tokio) next to the UI thread, so a slow server never freezes the window.
-- **Checked dependencies.** Dependencies are pinned in `Cargo.lock` and checked against the [RustSec advisory database](https://rustsec.org/) with `cargo audit` in CI.
+- **Checked dependencies.** Dependencies are pinned in `Cargo.lock` and checked against the [RustSec advisory database](https://rustsec.org/) with `cargo audit` in CI. The build workflows pin each GitHub Action to an exact commit, and only the final publish step may write to the repository.
 
 To be fair to C: the GUI toolkit (GTK, libadwaita, VTE) and `ssh` are still the system's own C programs. You get those from your distribution, with its security updates.
 
@@ -89,7 +89,7 @@ To be fair to C: the GUI toolkit (GTK, libadwaita, VTE) and `ssh` are still the 
 - **No daemon, no listening sockets, no telemetry, no update checker.** One app process, plus what its tabs run: your shell in local terminals, the system `ssh` in the others, and one shared connection per host (below).
 - **No stored secrets.** Authentication is entirely OpenSSH: keys, agent, `known_hosts`, prompts in the terminal.
 - **No shell in between.** `ssh` is started with an argument list, never through `sh -c`, and the alias always follows `--`, so it can never be read as an option (blocks `-oProxyCommand=…` style injection). New entries are validated before they are written.
-- **SFTP never prompts** (`BatchMode=yes`). It reuses the terminal's connection through a multiplexing socket in a private `0700` folder under `$XDG_RUNTIME_DIR`. That shared connection runs in its own background `ssh`, so closing one tab never cuts another tab to the same host. It closes 10 minutes after its last tab (`ControlPersist=10m`), so reopening is instant, and right away when the app quits. Keep-alives (`ServerAliveInterval=30`, `ServerAliveCountMax=4`) notice a dead link within about two minutes.
+- **SFTP never prompts** (`BatchMode=yes`). It reuses the terminal's connection through a multiplexing socket in a private `0700` folder under `$XDG_RUNTIME_DIR`, used only if that runtime folder really is private (yours, `0700`, not a symlink); a shared one such as `/tmp` would let another user plant a fake socket, so sharing is then turned off. That shared connection runs in its own background `ssh`, so closing one tab never cuts another tab to the same host. It closes 10 minutes after its last tab (`ControlPersist=10m`), so reopening is instant, and right away when the app quits. Keep-alives (`ServerAliveInterval=30`, `ServerAliveCountMax=4`) notice a dead link within about two minutes.
 - **Hostile servers can't write outside your folder.** Remote file names containing `/`, `..` or NUL are ignored, downloads never overwrite an existing file (and a failed one leaves nothing behind), uploads never replace a remote file (exclusive create, no check-then-write race), and recursive delete never follows symlinks.
 - **Private files.** The layout file is written atomically with mode `0600`.
 

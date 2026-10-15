@@ -328,11 +328,9 @@ async fn upload(
 
 /// Folders first, then by name.
 fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        b.dir
-            .cmp(&a.dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    // Each lowercase name is made once, not twice per comparison. Stable,
+    // like the comparison sort: equal names keep their order.
+    entries.sort_by_cached_key(|e| (!e.dir, e.name.to_lowercase()));
 }
 
 /// A local folder: `~` is the home folder. Links to folders count as folders.
@@ -1391,6 +1389,36 @@ mod tests {
             || n.contains("zip")
             || n.contains("archive")));
         assert!(names("notes.txt").contains(&"text-plain".to_owned()));
+    }
+
+    #[test]
+    fn sorts_like_the_plain_comparison() {
+        let names = [
+            "b", "B", "a.txt", "École", "ecole", "Zeta", "ß", "SS", "b", "_x", "10", "9",
+        ];
+        let entries: Vec<Entry> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Entry {
+                name: (*name).to_owned(),
+                // Tells equal names apart, to check their order is kept.
+                path: i.to_string(),
+                dir: i % 3 == 0,
+                link: false,
+                size: 0,
+                modified: None,
+            })
+            .collect();
+        let mut expected = entries.clone();
+        expected.sort_by(|a, b| {
+            b.dir
+                .cmp(&a.dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        let mut sorted = entries;
+        sort_entries(&mut sorted);
+        let paths = |v: &[Entry]| v.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&sorted), paths(&expected));
     }
 
     #[test]

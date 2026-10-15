@@ -7,7 +7,7 @@ mod store;
 mod terminal;
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -64,8 +64,8 @@ pub fn spawn<T: Send + 'static>(
 
 pub struct App {
     pub layout: RefCell<Layout>,
-    /// Hosts from ~/.ssh/config, in file order.
-    pub hosts: RefCell<Vec<Host>>,
+    /// Hosts from ~/.ssh/config, by alias (the sidebar order is the layout's).
+    pub hosts: RefCell<HashMap<String, Host>>,
     pub path: PathBuf,
     pub config_path: PathBuf,
     /// Watched files and folders of the ssh config (it can `Include` others).
@@ -97,11 +97,7 @@ impl App {
     }
 
     pub fn host(&self, alias: &str) -> Option<Host> {
-        self.hosts
-            .borrow()
-            .iter()
-            .find(|h| h.alias == alias)
-            .cloned()
+        self.hosts.borrow().get(alias).cloned()
     }
 
     /// Apply a change to the layout, save it and redraw the sidebar.
@@ -119,7 +115,7 @@ impl App {
         self.watch(config.watch);
         let hosts = config.hosts;
         let changed = self.layout.borrow_mut().reconcile(&hosts);
-        *self.hosts.borrow_mut() = hosts;
+        *self.hosts.borrow_mut() = hosts.into_iter().map(|h| (h.alias.clone(), h)).collect();
         if changed {
             self.commit(|_| Ok(()));
         } else {
@@ -523,7 +519,7 @@ fn build(application: &adw::Application) {
 
     let app = Rc::new(App {
         layout: RefCell::new(layout),
-        hosts: RefCell::new(Vec::new()),
+        hosts: RefCell::default(),
         path,
         config_path: store::ssh_config_path(),
         watched: RefCell::default(),
