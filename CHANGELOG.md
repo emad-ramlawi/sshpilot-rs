@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.4
 
 **Faster**
 - Large configs: with 10,000 hosts, reloading `~/.ssh/config` and redrawing the sidebar takes about 0.4–0.5 s instead of 1.1–1.6 s (host lookups, duplicate checks and layout matching no longer rescan every host). No difference you'd notice at a few hundred hosts.
