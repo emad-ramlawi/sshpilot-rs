@@ -1,6 +1,8 @@
-//! A file manager tab: SFTP spoken over the system `ssh` (see `ssh::sftp_args`).
+//! A file manager tab: your files on the left, the server's on the right,
+//! with Upload and Download between them. SFTP is spoken over the system
+//! `ssh` (see `ssh::sftp_args`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -12,16 +14,34 @@ use adw::prelude::*;
 use anyhow::{Context, Result, bail};
 use gtk::{gdk, gio, glib};
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{App, dialogs, sidebar, spawn, ssh};
+use crate::{App, dialogs, sidebar, spawn, ssh, store};
 
 #[derive(Clone, Debug)]
 struct Entry {
     name: String,
+    /// Full path, fixed when listed (the folder shown can change while a
+    /// menu or dialog is open).
+    path: String,
     dir: bool,
     link: bool,
     size: u64,
+}
+
+/// One side of the file manager: a folder listing under a path bar.
+struct Pane {
+    root: gtk::Box,
+    bar: gtk::Box,
+    up: gtk::Button,
+    refresh: gtk::Button,
+    path: gtk::Entry,
+    list: gtk::ListBox,
+    frame: gtk::Frame,
+    /// The folder shown, and its entries in row order.
+    cwd: RefCell<String>,
+    entries: RefCell<Vec<Entry>>,
 }
 
 struct Browser {
@@ -30,10 +50,13 @@ struct Browser {
     sftp: RefCell<Option<Arc<SftpSession>>>,
     /// Keeps the `ssh` process alive for as long as the tab is open.
     ssh: RefCell<Option<tokio::process::Child>>,
-    cwd: RefCell<String>,
-    entries: RefCell<Vec<Entry>>,
-    list: gtk::ListBox,
-    path: gtk::Entry,
+    connecting: Cell<bool>,
+    /// The tab is closed: don't start or keep a session.
+    closed: Cell<bool>,
+    /// My Files (this computer).
+    local: Pane,
+    /// Server Files.
+    remote: Pane,
     status: gtk::Label,
 }
 
@@ -129,6 +152,7 @@ async fn list_dir(sftp: Arc<SftpSession>, path: String) -> Result<(String, Vec<E
         .map(|e| {
             let kind = e.file_type();
             Entry {
+                path: join(&path, &e.file_name()),
                 name: e.file_name(),
                 dir: kind.is_dir(),
                 link: kind.is_symlink(),
@@ -136,11 +160,7 @@ async fn list_dir(sftp: Arc<SftpSession>, path: String) -> Result<(String, Vec<E
             }
         })
         .collect();
-    entries.sort_by(|a, b| {
-        b.dir
-            .cmp(&a.dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_entries(&mut entries);
     Ok((path, entries))
 }
 
@@ -167,6 +187,7 @@ fn remove_all(
     })
 }
 
+/// Copy a remote file to a new local file; a failed copy leaves no file behind.
 async fn download(sftp: Arc<SftpSession>, remote: String, local: PathBuf) -> Result<()> {
     let mut source = sftp.open(remote).await?;
     let mut target = tokio::fs::OpenOptions::new()
@@ -174,233 +195,168 @@ async fn download(sftp: Arc<SftpSession>, remote: String, local: PathBuf) -> Res
         .create_new(true)
         .open(&local)
         .await?;
-    tokio::io::copy(&mut source, &mut target).await?;
-    target.flush().await?;
+    let copied = async {
+        tokio::io::copy(&mut source, &mut target).await?;
+        target.flush().await
+    }
+    .await;
+    if let Err(e) = copied {
+        drop(target);
+        let _ = tokio::fs::remove_file(&local).await;
+        return Err(e.into());
+    }
     Ok(())
 }
 
+/// Copy a local file to a new remote file; never replaces one that exists.
 async fn upload(sftp: Arc<SftpSession>, local: PathBuf, remote: String) -> Result<()> {
-    if sftp.metadata(remote.clone()).await.is_ok() {
-        bail!("{} already exists", remote);
-    }
     let mut source = tokio::fs::File::open(&local).await?;
-    let mut target = sftp.create(remote).await?;
-    tokio::io::copy(&mut source, &mut target).await?;
-    target.shutdown().await?;
+    // EXCLUDE makes the server refuse an existing name, with no check-then-create race.
+    let opened = sftp
+        .open_with_flags(
+            remote.clone(),
+            OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+        )
+        .await;
+    let mut target = match opened {
+        Ok(file) => file,
+        Err(e) => {
+            // Servers report a taken name as a generic failure: say which it was.
+            if sftp.symlink_metadata(remote.clone()).await.is_ok() {
+                bail!("{remote} already exists");
+            }
+            return Err(e.into());
+        }
+    };
+    let copied = async {
+        tokio::io::copy(&mut source, &mut target).await?;
+        target.shutdown().await
+    }
+    .await;
+    if let Err(e) = copied {
+        drop(target);
+        let _ = sftp.remove_file(remote).await;
+        return Err(e.into());
+    }
     Ok(())
 }
 
-pub fn open(app: &Rc<App>, alias: &str) {
-    let up = gtk::Button::builder()
-        .icon_name("go-up-symbolic")
-        .tooltip_text("Parent Folder")
-        .build();
-    let path = gtk::Entry::builder().hexpand(true).build();
-    let upload_button = gtk::Button::builder()
-        .icon_name("document-send-symbolic")
-        .tooltip_text("Upload Files")
-        .build();
-    let new_folder = gtk::Button::builder()
-        .icon_name("folder-new-symbolic")
-        .tooltip_text("New Folder")
-        .build();
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    bar.set_margin_top(6);
-    bar.set_margin_start(6);
-    bar.set_margin_end(6);
-    bar.append(&up);
-    bar.append(&path);
-    bar.append(&upload_button);
-    bar.append(&new_folder);
-
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Multiple);
-    list.set_activate_on_single_click(false);
-    list.add_css_class("navigation-sidebar");
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&list)
-        .vexpand(true)
-        .build();
-    let status = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .margin_start(8)
-        .margin_end(8)
-        .margin_bottom(6)
-        .build();
-    status.add_css_class("dim-label");
-    status.add_css_class("caption");
-
-    let page_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    page_box.append(&bar);
-    page_box.append(&scroller);
-    page_box.append(&status);
-
-    let browser = Rc::new(Browser {
-        app: app.clone(),
-        alias: alias.to_owned(),
-        sftp: RefCell::new(None),
-        ssh: RefCell::new(None),
-        cwd: RefCell::new(".".to_owned()),
-        entries: RefCell::new(Vec::new()),
-        list: list.clone(),
-        path: path.clone(),
-        status,
+/// Folders first, then by name.
+fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-
-    up.connect_clicked(glib::clone!(
-        #[strong]
-        browser,
-        move |_| {
-            let target = parent(&browser.cwd.borrow());
-            browser.navigate(target);
-        }
-    ));
-    path.connect_activate(glib::clone!(
-        #[strong]
-        browser,
-        move |entry| browser.navigate(entry.text().to_string())
-    ));
-    upload_button.connect_clicked(glib::clone!(
-        #[strong]
-        browser,
-        move |_| browser.choose_uploads()
-    ));
-    new_folder.connect_clicked(glib::clone!(
-        #[strong]
-        browser,
-        move |_| browser.ask_new_folder()
-    ));
-    list.connect_row_activated(glib::clone!(
-        #[strong]
-        browser,
-        move |_, row| {
-            let entry = browser.entries.borrow().get(row.index() as usize).cloned();
-            match entry {
-                Some(e) if e.dir || e.link => {
-                    let target = join(&browser.cwd.borrow(), &e.name);
-                    browser.navigate(target);
-                }
-                Some(e) => browser.choose_download(vec![e]),
-                None => {}
-            }
-        }
-    ));
-
-    let menu_click = gtk::GestureClick::builder()
-        .button(gdk::BUTTON_SECONDARY)
-        .build();
-    menu_click.connect_pressed(glib::clone!(
-        #[strong]
-        browser,
-        move |_, _, x, y| browser.context_menu(x, y)
-    ));
-    list.add_controller(menu_click);
-
-    // Drop files from the desktop to upload them here.
-    let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
-    drop.connect_drop(glib::clone!(
-        #[strong]
-        browser,
-        move |_, value, _, _| {
-            let Ok(files) = value.get::<gdk::FileList>() else {
-                return false;
-            };
-            browser.upload_files(files.files().iter().filter_map(|f| f.path()).collect());
-            true
-        }
-    ));
-    scroller.add_controller(drop);
-
-    let page = app.tabs.append(&page_box);
-    page.set_title(&format!("Files — {alias}"));
-    page.set_icon(Some(&gio::ThemedIcon::new("folder-remote-symbolic")));
-    app.tabs.set_selected_page(&page);
-
-    // The tab's handlers keep `browser` alive, so end the session explicitly
-    // when the tab closes; otherwise its ssh would run until the app quits.
-    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
-    let closing = Rc::downgrade(&browser);
-    let id = app.tabs.connect_close_page(glib::clone!(
-        #[strong]
-        handler,
-        move |tabs, closed| {
-            if closed == &page {
-                if let Some(browser) = closing.upgrade() {
-                    browser.disconnect();
-                }
-                if let Some(id) = handler.take() {
-                    tabs.disconnect(id);
-                }
-            }
-            glib::Propagation::Proceed
-        }
-    ));
-    *handler.borrow_mut() = Some(id);
-
-    browser.navigate(".".to_owned());
 }
 
-impl Browser {
-    /// End the SFTP session: let ssh exit on its own, kill it if it hangs.
-    fn disconnect(&self) {
-        self.sftp.borrow_mut().take();
-        if let Some(mut child) = self.ssh.borrow_mut().take() {
-            crate::runtime().spawn(async move {
-                drop(child.stdin.take());
-                let exited =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
-                if exited.is_err() {
-                    let _ = child.kill().await;
-                }
-            });
+/// A local folder: `~` is the home folder. Links to folders count as folders.
+fn list_local(path: String) -> Result<(String, Vec<Entry>)> {
+    let path = match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            store::home_dir().join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(path),
+    };
+    let path = std::fs::canonicalize(&path)?;
+    let dir = path
+        .to_str()
+        .context("This folder's name is not valid UTF-8")?
+        .to_owned();
+    let mut entries: Vec<Entry> = std::fs::read_dir(&path)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok().filter(|n| safe_name(n))?;
+            let link = e.file_type().ok()?.is_symlink();
+            let meta = std::fs::metadata(e.path()).ok();
+            Some(Entry {
+                path: join(&dir, &name),
+                name,
+                dir: meta.as_ref().is_some_and(|m| m.is_dir()),
+                link,
+                size: meta.map_or(0, |m| m.len()),
+            })
+        })
+        .collect();
+    sort_entries(&mut entries);
+    Ok((dir, entries))
+}
+
+fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
+    gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(tooltip)
+        .build()
+}
+
+/// A button with a label and an arrow on the side it sends files to.
+fn transfer_button(label: &str, icon: &str, tooltip: &str, icon_first: bool) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_halign(gtk::Align::Center);
+    let image = gtk::Image::from_icon_name(icon);
+    let text = gtk::Label::new(Some(label));
+    if icon_first {
+        content.append(&image);
+        content.append(&text);
+    } else {
+        content.append(&text);
+        content.append(&image);
+    }
+    gtk::Button::builder()
+        .child(&content)
+        .tooltip_text(tooltip)
+        .build()
+}
+
+impl Pane {
+    fn new(title: &str) -> Pane {
+        let heading = gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build();
+        let up = icon_button("go-up-symbolic", "Parent Folder");
+        let refresh = icon_button("view-refresh-symbolic", "Refresh");
+        let path = gtk::Entry::builder().hexpand(true).build();
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bar.append(&up);
+        bar.append(&path);
+        bar.append(&refresh);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Multiple);
+        list.set_activate_on_single_click(false);
+        list.add_css_class("navigation-sidebar");
+        let frame = gtk::Frame::builder()
+            .child(
+                &gtk::ScrolledWindow::builder()
+                    .child(&list)
+                    .hscrollbar_policy(gtk::PolicyType::Never)
+                    .vexpand(true)
+                    .build(),
+            )
+            .build();
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        root.set_hexpand(true);
+        root.append(&heading);
+        root.append(&bar);
+        root.append(&frame);
+        Pane {
+            root,
+            bar,
+            up,
+            refresh,
+            path,
+            list,
+            frame,
+            cwd: RefCell::default(),
+            entries: RefCell::default(),
         }
     }
 
-    fn say(&self, message: &str) {
-        self.status.set_text(message);
-    }
-
-    /// Show `target`, connecting first if needed.
-    fn navigate(self: &Rc<Self>, target: String) {
-        let Some(sftp) = self.sftp.borrow().clone() else {
-            self.say(&format!("Connecting to {}…", self.alias));
-            let this = self.clone();
-            spawn(connect(ssh::sftp_args(&self.alias)), move |result| {
-                match result {
-                Ok((sftp, child)) => {
-                    *this.sftp.borrow_mut() = Some(Arc::new(sftp));
-                    *this.ssh.borrow_mut() = Some(child);
-                    this.navigate(target);
-                }
-                Err(e) => this.say(&format!(
-                    "Could not connect: {e}\nIf this host asks for a password, open a terminal to it first, \
-                     then press Enter in the path field to retry."
-                )),
-            }
-            });
-            return;
-        };
-        let this = self.clone();
-        spawn(list_dir(sftp, target), move |result| match result {
-            Ok((path, entries)) => {
-                this.path.set_text(&path);
-                *this.cwd.borrow_mut() = path;
-                this.show(entries);
-            }
-            Err(e) => {
-                this.path.set_text(&this.cwd.borrow());
-                this.say(&format!("Could not open that folder: {e}"));
-            }
-        });
-    }
-
-    fn refresh(self: &Rc<Self>) {
-        let cwd = self.cwd.borrow().clone();
-        self.navigate(cwd);
-    }
-
-    fn show(&self, entries: Vec<Entry>) {
+    fn show(&self, cwd: String, entries: Vec<Entry>) {
+        self.path.set_text(&cwd);
+        *self.cwd.borrow_mut() = cwd;
         self.list.remove_all();
         for e in &entries {
             let icon = if e.dir {
@@ -428,14 +384,22 @@ impl Browser {
             content.append(&size);
             self.list.append(&content);
         }
-        self.say(&format!("{} items", entries.len()));
         *self.entries.borrow_mut() = entries;
+    }
+
+    /// Show the current folder in the path bar again (after a failed jump).
+    fn reset_path(&self) {
+        self.path.set_text(&self.cwd.borrow());
+    }
+
+    fn entry_at(&self, row: &gtk::ListBoxRow) -> Option<Entry> {
+        let index = usize::try_from(row.index()).ok()?;
+        self.entries.borrow().get(index).cloned()
     }
 
     /// The entries an action applies to: the selection if it includes the
     /// clicked row, otherwise just the clicked row.
     fn targets(&self, clicked: Option<gtk::ListBoxRow>) -> Vec<Entry> {
-        let entries = self.entries.borrow();
         if let Some(row) = clicked
             && !row.is_selected()
         {
@@ -445,86 +409,401 @@ impl Browser {
         self.list
             .selected_rows()
             .iter()
-            .filter_map(|row| entries.get(row.index() as usize).cloned())
+            .filter_map(|row| self.entry_at(row))
             .collect()
     }
+}
 
-    fn context_menu(self: &Rc<Self>, x: f64, y: f64) {
-        let row = self.list.row_at_y(y as i32);
+pub fn open(app: &Rc<App>, alias: &str) {
+    let local = Pane::new("My Files");
+    let remote = Pane::new(&format!("Server Files — {alias}"));
+    let new_folder = icon_button("folder-new-symbolic", "New Folder");
+    remote.bar.append(&new_folder);
+
+    let upload = transfer_button(
+        "Upload",
+        "go-next-symbolic",
+        "Copy the selected files to the server",
+        false,
+    );
+    let download = transfer_button(
+        "Download",
+        "go-previous-symbolic",
+        "Copy the selected server files to My Files",
+        true,
+    );
+    let middle = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    middle.set_valign(gtk::Align::Center);
+    middle.append(&upload);
+    middle.append(&download);
+
+    let panes = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    panes.set_homogeneous(false);
+    panes.set_vexpand(true);
+    panes.set_margin_top(6);
+    panes.set_margin_start(6);
+    panes.set_margin_end(6);
+    panes.append(&local.root);
+    panes.append(&middle);
+    panes.append(&remote.root);
+
+    let status = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .margin_start(8)
+        .margin_end(8)
+        .margin_bottom(6)
+        .build();
+    status.add_css_class("dim-label");
+    status.add_css_class("caption");
+
+    let page_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    page_box.append(&panes);
+    page_box.append(&status);
+
+    let browser = Rc::new(Browser {
+        app: app.clone(),
+        alias: alias.to_owned(),
+        sftp: RefCell::new(None),
+        ssh: RefCell::new(None),
+        connecting: Cell::new(false),
+        closed: Cell::new(false),
+        local,
+        remote,
+        status,
+    });
+    let (local, remote) = (&browser.local, &browser.remote);
+
+    // My Files.
+    local.up.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| {
+            let target = parent(&browser.local.cwd.borrow());
+            browser.navigate_local(target);
+        }
+    ));
+    local.path.connect_activate(glib::clone!(
+        #[strong]
+        browser,
+        move |entry| browser.navigate_local(entry.text().to_string())
+    ));
+    local.refresh.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| browser.refresh_local()
+    ));
+    local.list.connect_row_activated(glib::clone!(
+        #[strong]
+        browser,
+        move |_, row| match browser.local.entry_at(row) {
+            Some(e) if e.dir => browser.navigate_local(e.path),
+            Some(e) => browser.upload_files(vec![PathBuf::from(e.path)]),
+            None => {}
+        }
+    ));
+
+    // Server Files.
+    remote.up.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| {
+            let target = parent(&browser.remote.cwd.borrow());
+            browser.navigate(target);
+        }
+    ));
+    remote.path.connect_activate(glib::clone!(
+        #[strong]
+        browser,
+        move |entry| browser.navigate(entry.text().to_string())
+    ));
+    remote.refresh.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| browser.refresh()
+    ));
+    new_folder.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| browser.ask_new_folder()
+    ));
+    remote.list.connect_row_activated(glib::clone!(
+        #[strong]
+        browser,
+        move |_, row| match browser.remote.entry_at(row) {
+            Some(e) if e.dir => browser.navigate(e.path),
+            Some(e) if e.link => browser.open_link(e),
+            Some(e) => browser.download(vec![e]),
+            None => {}
+        }
+    ));
+
+    upload.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| {
+            let selected = browser.local.targets(None);
+            browser.upload_entries(selected);
+        }
+    ));
+    download.connect_clicked(glib::clone!(
+        #[strong]
+        browser,
+        move |_| {
+            let selected = browser.remote.targets(None);
+            browser.download(selected);
+        }
+    ));
+
+    for (pane, server) in [(local, false), (remote, true)] {
+        let menu_click = gtk::GestureClick::builder()
+            .button(gdk::BUTTON_SECONDARY)
+            .build();
+        menu_click.connect_pressed(glib::clone!(
+            #[strong]
+            browser,
+            move |_, _, x, y| browser.context_menu(server, x, y)
+        ));
+        pane.list.add_controller(menu_click);
+    }
+
+    // Drop files from the desktop on Server Files to upload them.
+    let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    drop.connect_drop(glib::clone!(
+        #[strong]
+        browser,
+        move |_, value, _, _| {
+            let Ok(files) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            browser.upload_files(files.files().iter().filter_map(|f| f.path()).collect());
+            true
+        }
+    ));
+    remote.frame.add_controller(drop);
+
+    app.connected_to(alias);
+    let page = app.tabs.append(&page_box);
+    page.set_title(&format!("Files — {alias}"));
+    page.set_icon(Some(&gio::ThemedIcon::new("folder-remote-symbolic")));
+    app.tabs.set_selected_page(&page);
+
+    // The tab's handlers keep `browser` alive, so end the session explicitly
+    // when the tab closes; otherwise its ssh would run until the app quits.
+    let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+    let closing = Rc::downgrade(&browser);
+    let id = app.tabs.connect_close_page(glib::clone!(
+        #[strong]
+        handler,
+        move |tabs, closed| {
+            if closed == &page {
+                if let Some(browser) = closing.upgrade() {
+                    browser.disconnect();
+                }
+                if let Some(id) = handler.take() {
+                    tabs.disconnect(id);
+                }
+            }
+            glib::Propagation::Proceed
+        }
+    ));
+    *handler.borrow_mut() = Some(id);
+
+    browser.navigate_local("~".to_owned());
+    browser.navigate(".".to_owned());
+}
+
+impl Browser {
+    /// End the SFTP session: let ssh exit on its own, kill it if it hangs.
+    fn disconnect(&self) {
+        self.closed.set(true);
+        self.sftp.borrow_mut().take();
+        if let Some(mut child) = self.ssh.borrow_mut().take() {
+            crate::runtime().spawn(async move {
+                drop(child.stdin.take());
+                let exited =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                if exited.is_err() {
+                    let _ = child.kill().await;
+                }
+            });
+        }
+    }
+
+    fn say(&self, message: &str) {
+        self.status.set_text(message);
+    }
+
+    /// Forget the session if its ssh has exited (dropped connection, or the
+    /// shared connection was closed), so the next action reconnects.
+    fn drop_if_dead(&self) {
+        let _runtime = crate::runtime().enter();
+        let mut ssh = self.ssh.borrow_mut();
+        if let Some(child) = ssh.as_mut()
+            && !matches!(child.try_wait(), Ok(None))
+        {
+            *ssh = None;
+            self.sftp.borrow_mut().take();
+        }
+    }
+
+    /// Show `target` in My Files.
+    fn navigate_local(self: &Rc<Self>, target: String) {
+        let this = self.clone();
+        spawn(
+            async move { tokio::task::spawn_blocking(move || list_local(target)).await? },
+            move |result| match result {
+                Ok((path, entries)) => this.local.show(path, entries),
+                Err(e) => {
+                    this.local.reset_path();
+                    this.say(&format!("Could not open that folder: {e}"));
+                }
+            },
+        );
+    }
+
+    fn refresh_local(self: &Rc<Self>) {
+        let cwd = self.local.cwd.borrow().clone();
+        self.navigate_local(cwd);
+    }
+
+    /// Show `target` in Server Files, connecting first if needed.
+    fn navigate(self: &Rc<Self>, target: String) {
+        if self.closed.get() || self.connecting.get() {
+            return;
+        }
+        self.drop_if_dead();
+        let Some(sftp) = self.sftp.borrow().clone() else {
+            self.say(&format!("Connecting to {}…", self.alias));
+            self.connecting.set(true);
+            let this = self.clone();
+            spawn(connect(ssh::sftp_args(&self.alias)), move |result| {
+                this.connecting.set(false);
+                if this.closed.get() {
+                    // The tab closed meanwhile; dropping the session ends its ssh.
+                    return;
+                }
+                match result {
+                    Ok((sftp, child)) => {
+                        *this.sftp.borrow_mut() = Some(Arc::new(sftp));
+                        *this.ssh.borrow_mut() = Some(child);
+                        this.say(&format!("Connected to {}", this.alias));
+                        this.navigate(target);
+                    }
+                    Err(e) => this.say(&format!(
+                        "Could not connect: {e}\nIf this host asks for a password, open a terminal to it first, \
+                         then press Enter in the server path field to retry."
+                    )),
+                }
+            });
+            return;
+        };
+        let this = self.clone();
+        spawn(list_dir(sftp, target), move |result| match result {
+            Ok((path, entries)) => this.remote.show(path, entries),
+            Err(e) => {
+                this.remote.reset_path();
+                this.say(&format!("Could not open that folder: {e}"));
+            }
+        });
+    }
+
+    fn refresh(self: &Rc<Self>) {
+        let cwd = self.remote.cwd.borrow().clone();
+        self.navigate(if cwd.is_empty() { ".".to_owned() } else { cwd });
+    }
+
+    /// A server symlink: open it if it leads to a folder, otherwise download it.
+    fn open_link(self: &Rc<Self>, entry: Entry) {
+        let Some(sftp) = self.sftp.borrow().clone() else {
+            return;
+        };
+        let this = self.clone();
+        let path = entry.path.clone();
+        spawn(
+            async move { Ok(sftp.metadata(path).await?.is_dir()) },
+            move |result| match result {
+                Ok(true) => this.navigate(entry.path),
+                Ok(false) => this.download(vec![entry]),
+                Err(e) => this.say(&format!("Could not open {}: {e}", entry.name)),
+            },
+        );
+    }
+
+    fn context_menu(self: &Rc<Self>, server: bool, x: f64, y: f64) {
+        let pane = if server { &self.remote } else { &self.local };
+        let row = pane.list.row_at_y(y as i32);
         let item = |f: fn(&Rc<Browser>, Vec<Entry>), targets: Vec<Entry>| -> Box<dyn Fn()> {
             let this = self.clone();
             Box::new(move || f(&this, targets.clone()))
         };
-        let items: sidebar::MenuItems = if row.is_some() {
-            let targets = self.targets(row);
-            let mut items = vec![("Download…", item(Browser::choose_download, targets.clone()))];
-            if targets.len() == 1 {
-                items.push(("Rename…", item(Browser::ask_rename, targets.clone())));
+        let items: sidebar::MenuItems = match (server, row.is_some()) {
+            (true, true) => {
+                let targets = pane.targets(row);
+                let mut items = vec![("Download", item(Browser::download, targets.clone()))];
+                if targets.len() == 1 {
+                    items.push(("Rename…", item(Browser::ask_rename, targets.clone())));
+                }
+                items.push(("Delete…", item(Browser::ask_delete, targets)));
+                items
             }
-            items.push(("Delete…", item(Browser::ask_delete, targets)));
-            items
-        } else {
-            vec![
-                ("Upload Files…", item(|b, _| b.choose_uploads(), vec![])),
+            (true, false) => vec![
                 ("New Folder…", item(|b, _| b.ask_new_folder(), vec![])),
                 ("Refresh", item(|b, _| b.refresh(), vec![])),
-            ]
+            ],
+            (false, true) => vec![("Upload", item(Browser::upload_entries, pane.targets(row)))],
+            (false, false) => vec![("Refresh", item(|b, _| b.refresh_local(), vec![]))],
         };
-        sidebar::popup_menu(self.list.upcast_ref(), x, y, items);
+        sidebar::popup_menu(pane.list.upcast_ref(), x, y, items);
     }
 
-    fn choose_download(self: &Rc<Self>, targets: Vec<Entry>) {
+    /// Copy server files into the folder shown in My Files.
+    fn download(self: &Rc<Self>, targets: Vec<Entry>) {
+        if targets.is_empty() {
+            self.say("Select files in Server Files first.");
+            return;
+        }
         let files: Vec<Entry> = targets.into_iter().filter(|e| !e.dir).collect();
         if files.is_empty() {
             self.say("Folders can't be downloaded yet; open one and pick its files.");
             return;
         }
-        let this = self.clone();
-        let dialog = gtk::FileDialog::builder()
-            .title("Download To")
-            .modal(true)
-            .build();
-        glib::spawn_future_local(async move {
-            let Ok(folder) = dialog.select_folder_future(Some(&this.app.window)).await else {
-                return;
-            };
-            let Some(folder) = folder.path() else { return };
-            let Some(sftp) = this.sftp.borrow().clone() else {
-                return;
-            };
-            for e in files {
-                let remote = join(&this.cwd.borrow(), &e.name);
-                let local = free_local_path(&folder, &e.name);
-                this.say(&format!("Downloading {}…", e.name));
-                let this2 = this.clone();
-                let shown = local.display().to_string();
-                spawn(
-                    download(sftp.clone(), remote, local),
-                    move |result| match result {
-                        Ok(()) => this2.say(&format!("Saved {shown}")),
-                        Err(err) => this2.say(&format!("Download of {} failed: {err}", e.name)),
-                    },
-                );
-            }
-        });
+        let Some(sftp) = self.sftp.borrow().clone() else {
+            self.say("Not connected.");
+            return;
+        };
+        let folder = PathBuf::from(self.local.cwd.borrow().clone());
+        for e in files {
+            let local = free_local_path(&folder, &e.name);
+            self.say(&format!("Downloading {}…", e.name));
+            let this = self.clone();
+            let shown = local.display().to_string();
+            spawn(download(sftp.clone(), e.path, local), move |result| {
+                match result {
+                    Ok(()) => this.say(&format!("Saved {shown}")),
+                    Err(err) => this.say(&format!("Download of {} failed: {err}", e.name)),
+                }
+                this.refresh_local();
+            });
+        }
     }
 
-    fn choose_uploads(self: &Rc<Self>) {
-        let this = self.clone();
-        let dialog = gtk::FileDialog::builder()
-            .title("Upload Files")
-            .modal(true)
-            .build();
-        glib::spawn_future_local(async move {
-            let Ok(model) = dialog.open_multiple_future(Some(&this.app.window)).await else {
-                return;
-            };
-            let paths = (0..model.n_items())
-                .filter_map(|i| model.item(i).and_downcast::<gio::File>())
-                .filter_map(|f| f.path())
-                .collect();
-            this.upload_files(paths);
-        });
+    /// Copy files selected in My Files to the folder shown in Server Files.
+    fn upload_entries(self: &Rc<Self>, targets: Vec<Entry>) {
+        if targets.is_empty() {
+            self.say("Select files in My Files first.");
+            return;
+        }
+        if targets.iter().all(|e| e.dir) {
+            self.say("Folders can't be uploaded yet; open one and pick its files.");
+            return;
+        }
+        let paths = targets
+            .into_iter()
+            .filter(|e| !e.dir)
+            .map(|e| PathBuf::from(e.path))
+            .collect();
+        self.upload_files(paths);
     }
 
     fn upload_files(self: &Rc<Self>, paths: Vec<PathBuf>) {
@@ -547,7 +826,7 @@ impl Browser {
                 ));
                 continue;
             }
-            let remote = join(&self.cwd.borrow(), &name);
+            let remote = join(&self.remote.cwd.borrow(), &name);
             self.say(&format!("Uploading {name}…"));
             let this = self.clone();
             spawn(
@@ -573,7 +852,7 @@ impl Browser {
             let Some(sftp) = this.sftp.borrow().clone() else {
                 return;
             };
-            let path = join(&this.cwd.borrow(), &name);
+            let path = join(&this.remote.cwd.borrow(), &name);
             let this = this.clone();
             spawn(
                 async move { Ok(sftp.create_dir(path).await?) },
@@ -604,8 +883,8 @@ impl Browser {
                 let Some(sftp) = this.sftp.borrow().clone() else {
                     return;
                 };
-                let cwd = this.cwd.borrow().clone();
-                let (from, to) = (join(&cwd, &entry.name), join(&cwd, &name));
+                let from = entry.path.clone();
+                let to = join(&parent(&from), &name);
                 let this = this.clone();
                 spawn(
                     async move { Ok(sftp.rename(from, to).await?) },
@@ -636,10 +915,9 @@ impl Browser {
             let Some(sftp) = this.sftp.borrow().clone() else {
                 return;
             };
-            let cwd = this.cwd.borrow().clone();
             let work = targets
                 .iter()
-                .map(|e| (join(&cwd, &e.name), e.dir && !e.link))
+                .map(|e| (e.path.clone(), e.dir && !e.link))
                 .collect::<Vec<_>>();
             this.say("Deleting…");
             let this = this.clone();
@@ -689,6 +967,31 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "x").unwrap();
         assert_eq!(free_local_path(&dir, "a.txt"), dir.join("a (2).txt"));
         assert_eq!(free_local_path(&dir, "b.txt"), dir.join("b.txt"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lists_local_folders_first_and_follows_links() {
+        let dir = std::env::temp_dir().join(format!("sshpilot-rs-local-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Zeta")).unwrap();
+        std::fs::write(dir.join("alpha.txt"), "12345").unwrap();
+        std::os::unix::fs::symlink(dir.join("Zeta"), dir.join("link-to-dir")).unwrap();
+        let (path, entries) = list_local(dir.to_str().unwrap().to_owned()).unwrap();
+        let shown: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.dir, e.link))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("link-to-dir", true, true),
+                ("Zeta", true, false),
+                ("alpha.txt", false, false)
+            ]
+        );
+        assert_eq!(entries[2].size, 5);
+        assert_eq!(entries[2].path, join(&path, "alpha.txt"));
+        assert!(list_local("~".to_owned()).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

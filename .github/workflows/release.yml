@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build and publish the amd64 + arm64 tarballs.
+# Push a tag like v0.1.0 to build and publish the amd64 + arm64 binaries (+ .sha256).
 on:
   push:
     tags: ["v*"]

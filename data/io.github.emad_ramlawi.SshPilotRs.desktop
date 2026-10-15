@@ -8,3 +8,4 @@ Terminal=false
 Categories=Network;RemoteAccess;GTK;
 Keywords=ssh;sftp;terminal;remote;server;
 StartupNotify=true
+StartupWMClass=io.github.emad_ramlawi.SshPilotRs

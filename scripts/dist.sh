@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build both release tarballs (amd64 + arm64) inside Ubuntu 24.04 containers,
+# Build both release binaries (amd64 + arm64) inside Ubuntu 24.04 containers,
 # so the binaries run on Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, ...
 # arm64 runs under qemu emulation (needs qemu-user-static + binfmt): slow but simple.
 # Usage: scripts/dist.sh [amd64|arm64]...   (default: both)

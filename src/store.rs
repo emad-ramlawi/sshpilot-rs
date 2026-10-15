@@ -49,58 +49,194 @@ pub fn ssh_config_path() -> PathBuf {
 fn usable_alias(alias: &str) -> bool {
     !alias.is_empty()
         && !alias.starts_with('-')
-        && !alias.contains(['*', '?', '!', '"'])
+        && !alias.contains(['*', '?', '!', '"', '#'])
         && !alias.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// What `load_ssh_config` found.
+pub struct SshConfig {
+    pub hosts: Vec<Host>,
+    /// Files read and folders searched, to reload when they change.
+    pub watch: Vec<PathBuf>,
+}
+
+/// ssh's limit on nested `Include`s.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// The hosts of the config file at `path` and of the files it includes.
+pub fn load_ssh_config(path: &Path) -> SshConfig {
+    let mut parser = Parser {
+        include_dir: path.parent().map(Path::to_owned),
+        ..Parser::default()
+    };
+    parser.file(path);
+    SshConfig {
+        hosts: parser.hosts,
+        watch: parser.watch,
+    }
+}
+
 /// Concrete `Host` aliases in file order (wildcard patterns are skipped).
+/// `Include` is ignored; see `load_ssh_config`.
+#[cfg(test)]
 pub fn parse_ssh_config(text: &str) -> Vec<Host> {
-    let mut hosts: Vec<Host> = Vec::new();
-    // Indexes into `hosts` that the current block applies to.
-    let mut current: Vec<usize> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    let mut parser = Parser::default();
+    parser.text(text);
+    parser.hosts
+}
+
+#[derive(Default)]
+struct Parser {
+    hosts: Vec<Host>,
+    /// Indexes into `hosts` that the current block applies to.
+    current: Vec<usize>,
+    /// Where relative `Include` paths start (`None`: ignore `Include`).
+    include_dir: Option<PathBuf>,
+    /// Files being read, outermost first, to stop include loops.
+    stack: Vec<PathBuf>,
+    watch: Vec<PathBuf>,
+}
+
+impl Parser {
+    fn file(&mut self, path: &Path) {
+        if !self.watch.iter().any(|p| p == path) {
+            self.watch.push(path.to_owned());
         }
-        let (keyword, rest) = match line.split_once(|c: char| c.is_whitespace() || c == '=') {
-            Some((k, rest)) => (
-                k,
-                rest.trim_start_matches(|c: char| c.is_whitespace() || c == '='),
-            ),
-            None => (line, ""),
+        let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if path.is_dir() || self.stack.len() > MAX_INCLUDE_DEPTH || self.stack.contains(&real) {
+            return;
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
         };
-        let value = rest.split('#').next().unwrap_or("").trim();
-        match keyword.to_ascii_lowercase().as_str() {
-            "host" => {
-                current.clear();
-                for alias in value.split_whitespace() {
-                    if !usable_alias(alias) || hosts.iter().any(|h| h.alias == alias) {
-                        continue;
+        self.stack.push(real);
+        self.text(&text);
+        self.stack.pop();
+    }
+
+    fn text(&mut self, text: &str) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (keyword, rest) = match line.split_once(|c: char| c.is_whitespace() || c == '=') {
+                Some((k, rest)) => (
+                    k,
+                    rest.trim_start_matches(|c: char| c.is_whitespace() || c == '='),
+                ),
+                None => (line, ""),
+            };
+            let value = rest.split('#').next().unwrap_or("").trim();
+            match keyword.to_ascii_lowercase().as_str() {
+                "host" => {
+                    self.current.clear();
+                    for alias in value.split_whitespace() {
+                        if !usable_alias(alias) || self.hosts.iter().any(|h| h.alias == alias) {
+                            continue;
+                        }
+                        self.current.push(self.hosts.len());
+                        self.hosts.push(Host {
+                            alias: alias.to_owned(),
+                            ..Default::default()
+                        });
                     }
-                    current.push(hosts.len());
-                    hosts.push(Host {
-                        alias: alias.to_owned(),
-                        ..Default::default()
-                    });
                 }
-            }
-            "match" => current.clear(),
-            key @ ("hostname" | "user" | "port") if !value.is_empty() => {
-                for &i in &current {
-                    // First value wins, as in ssh.
-                    let slot = match key {
-                        "hostname" => &mut hosts[i].hostname,
-                        "user" => &mut hosts[i].user,
-                        _ => &mut hosts[i].port,
+                "match" => self.current.clear(),
+                "include" => {
+                    let Some(dir) = self.include_dir.clone() else {
+                        continue;
                     };
-                    slot.get_or_insert_with(|| value.to_owned());
+                    // Lines after the Include belong to the block it is in again.
+                    let block = self.current.clone();
+                    for pattern in value.split_whitespace() {
+                        for path in expand_include(pattern, &dir, &mut self.watch) {
+                            self.file(&path);
+                        }
+                    }
+                    self.current = block;
                 }
+                key @ ("hostname" | "user" | "port") if !value.is_empty() => {
+                    for &i in &self.current {
+                        // First value wins, as in ssh.
+                        let host = &mut self.hosts[i];
+                        let slot = match key {
+                            "hostname" => &mut host.hostname,
+                            "user" => &mut host.user,
+                            _ => &mut host.port,
+                        };
+                        slot.get_or_insert_with(|| value.to_owned());
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    hosts
+}
+
+/// The files an `Include` pattern names, like ssh's glob: `~` is the home
+/// folder, relative paths start in `dir`, and `*`/`?` match within one path
+/// component (not a leading dot). Folders searched are added to `watch`.
+fn expand_include(pattern: &str, dir: &Path, watch: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    let pattern = match pattern.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            home_dir().join(rest.trim_start_matches('/'))
+        }
+        _ => dir.join(pattern),
+    };
+    let mut found = vec![PathBuf::new()];
+    for part in pattern.components() {
+        let part = part.as_os_str();
+        let Some(glob) = part.to_str().filter(|p| p.contains(['*', '?'])) else {
+            found.iter_mut().for_each(|path| path.push(part));
+            continue;
+        };
+        let mut next = Vec::new();
+        for folder in &found {
+            if !watch.contains(folder) {
+                watch.push(folder.clone());
+            }
+            let Ok(entries) = fs::read_dir(folder) else {
+                continue;
+            };
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| {
+                    (glob.starts_with('.') || !name.starts_with('.')) && wildcard(glob, name)
+                })
+                .collect();
+            names.sort();
+            next.extend(names.into_iter().map(|name| folder.join(name)));
+        }
+        found = next;
+    }
+    found
+}
+
+/// Whether `text` matches `pattern`, where `*` is any run of characters and
+/// `?` any one character.
+fn wildcard(pattern: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti) = (0, 0);
+    // Last `*` seen and where in `text` it started matching.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            // Let that `*` take one more character and retry.
+            star = Some((sp, st + 1));
+            pi = sp + 1;
+            ti = st + 1;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// The fields of a new `Host` block.
@@ -115,7 +251,7 @@ pub struct NewHost {
 impl NewHost {
     pub fn validate(&self) -> Result<()> {
         if !usable_alias(self.alias.trim()) {
-            bail!("Name must be one word without * ? ! or a leading -");
+            bail!("Name must be one word without * ? ! # or a leading -");
         }
         let plain = |s: &str| {
             !s.starts_with('-')
@@ -158,7 +294,8 @@ impl NewHost {
 pub fn append_host(path: &Path, host: &NewHost) -> Result<()> {
     host.validate()?;
     let existing = fs::read_to_string(path).unwrap_or_default();
-    if parse_ssh_config(&existing)
+    if load_ssh_config(path)
+        .hosts
         .iter()
         .any(|h| h.alias == host.alias.trim())
     {
@@ -203,6 +340,9 @@ pub struct Layout {
     pub ungrouped: Vec<String>,
     #[serde(default)]
     next_id: Id,
+    /// Terminal text size, 1.0 = the system's monospace font size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_scale: Option<f64>,
 }
 
 impl Layout {
@@ -275,7 +415,9 @@ impl Layout {
         if name.is_empty() {
             bail!("Group name is required");
         }
-        self.next_id += 1;
+        // Above every id in use, even if the file was edited by hand.
+        let used = self.groups.iter().map(|g| g.id).max().unwrap_or(0);
+        self.next_id = self.next_id.max(used) + 1;
         let id = self.next_id;
         self.groups.push(Group {
             id,
@@ -391,6 +533,61 @@ mod tests {
     }
 
     #[test]
+    fn follows_includes_like_ssh() {
+        let dir = std::env::temp_dir().join(format!("sshpilot-rs-inc-{}", std::process::id()));
+        let d = dir.join("config.d");
+        fs::create_dir_all(&d).unwrap();
+        let config = dir.join("config");
+        fs::write(
+            &config,
+            "Host first\n  Include config.d/*.conf missing\n  User me\nInclude config\nHost last\n",
+        )
+        .unwrap();
+        fs::write(d.join("b.conf"), "Host b\n  HostName b.example\n").unwrap();
+        fs::write(d.join("a.conf"), "Host a\nInclude ../config.d/*.conf\n").unwrap();
+        fs::write(d.join(".hidden.conf"), "Host hidden\n").unwrap();
+        fs::write(d.join("notes.txt"), "Host txt\n").unwrap();
+
+        let found = load_ssh_config(&config);
+        let aliases: Vec<_> = found.hosts.iter().map(|h| h.alias.as_str()).collect();
+        assert_eq!(aliases, ["first", "a", "b", "last"]);
+        // `User me` follows the Include, so it is still `first`'s.
+        assert_eq!(found.hosts[0].target(), "me@first");
+        assert_eq!(found.hosts[2].target(), "b.example");
+        assert!(found.watch.contains(&config));
+        assert!(found.watch.contains(&d), "watch the folder a pattern reads");
+        assert!(found.watch.contains(&dir.join("missing")));
+        // Plain parsing leaves Include alone.
+        assert_eq!(
+            parse_ssh_config(&fs::read_to_string(&config).unwrap()).len(),
+            2
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wildcards() {
+        for (pattern, text) in [
+            ("*", "x"),
+            ("*.conf", "a.conf"),
+            ("a?c", "abc"),
+            ("*b*", "abc"),
+            ("*", ""),
+        ] {
+            assert!(wildcard(pattern, text), "{pattern} {text}");
+        }
+        for (pattern, text) in [("*.conf", "a.txt"), ("a?c", "ac"), ("abc", "abcd")] {
+            assert!(!wildcard(pattern, text), "{pattern} {text}");
+        }
+    }
+
+    #[test]
+    fn group_ids_stay_unique_after_hand_edits() {
+        let mut l: Layout = serde_json::from_str(r#"{"groups":[{"id":4,"name":"x"}]}"#).unwrap();
+        assert_eq!(l.add_group("y").unwrap(), 5);
+    }
+
+    #[test]
     fn reorders_within_a_list_both_ways() {
         let (mut l, _) = sample();
         l.move_host("c", None, 0).unwrap();
@@ -460,6 +657,10 @@ mod tests {
             },
             NewHost {
                 alias: "web*".into(),
+                ..ok.clone()
+            },
+            NewHost {
+                alias: "web#x".into(),
                 ..ok.clone()
             },
         ] {

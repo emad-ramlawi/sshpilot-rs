@@ -3,8 +3,12 @@
 //! Everything about a host (address, user, port, keys, jump hosts…) comes
 //! from `~/.ssh/config`: we only ever pass the alias. The terminal and the
 //! file manager share one SSH connection per host (OpenSSH multiplexing), so
-//! a password typed in the terminal also unlocks the file manager. Nothing
-//! outlives the app: each ssh process ends with the tab that started it.
+//! a password typed in the terminal also unlocks the file manager.
+//!
+//! The shared connection runs in its own background ssh (`ControlPersist`),
+//! not inside the first tab: otherwise closing that tab would cut every other
+//! tab to the same host. It ends a minute after its last tab closes, and the
+//! app ends it right away when it quits (`exit_args`).
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -36,7 +40,7 @@ fn base_args() -> Vec<String> {
             "-o".into(),
             format!("ControlPath={}/%C", dir.display()),
             "-o".into(),
-            "ControlPersist=no".into(),
+            "ControlPersist=60".into(),
         ]);
     }
     args
@@ -67,6 +71,15 @@ pub fn sftp_args(alias: &str) -> Vec<String> {
     args
 }
 
+/// Close the shared connection to `alias`, if there is one. Tabs still
+/// using it are cut, so this is only for when the app quits.
+pub fn exit_args(alias: &str) -> Option<Vec<String>> {
+    control_dir()?;
+    let mut args = base_args();
+    args.extend(["-O".into(), "exit".into(), "--".into(), alias.to_owned()]);
+    Some(args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +90,8 @@ mod tests {
         assert_eq!(&t[t.len() - 2..], ["--", "web"]);
         let s = sftp_args("web");
         assert_eq!(&s[s.len() - 3..], ["--", "web", "sftp"]);
+        if let Some(e) = exit_args("web") {
+            assert_eq!(&e[e.len() - 4..], ["-O", "exit", "--", "web"]);
+        }
     }
 }
